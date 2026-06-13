@@ -1,0 +1,40 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+pram_env/
+venv/
+env/
+locapram_env/
+
+#folders
+runs/
+LOCA-PRAM-main/
+demo_0001/
+
+# Model weights / large artifacts
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Ansys Fluent (large)
+*.cas
+*.cas.h5
+*.dat
+*.dat.h5
+*.msh
+
+# Scan output / data
+demo_*/
+stitched_*
+*_log_*.csv
+data/
+outputs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

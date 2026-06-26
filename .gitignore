@@ -13,6 +13,7 @@ locapram_env/
 runs/
 LOCA-PRAM-main/
 demo_0001/
+assays/
 
 # Model weights / large artifacts
 *.pt

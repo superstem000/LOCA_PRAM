@@ -14,6 +14,7 @@ runs/
 LOCA-PRAM-main/
 demo_0001/
 assays/
+topk_full_res/
 
 # Model weights / large artifacts
 *.pt

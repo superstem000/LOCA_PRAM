@@ -1,0 +1,7 @@
+{
+  "tanh_scale": 1.0,
+  "window_size": [
+    128,
+    128
+  ]
+}

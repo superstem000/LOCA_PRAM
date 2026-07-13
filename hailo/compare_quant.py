@@ -35,9 +35,12 @@ PREDS_FP_PATH = os.path.join(HERE, 'preds_fp.npy')
 PREDS_Q_PATH  = os.path.join(HERE, 'preds_quant.npy')
 POSTPROC_PATH = os.path.join(HERE, 'postprocess.json')
 
-# Hailo -> semantic mapping (mirrors EXPECTED_OUTPUT_MAP in build.py).
-NAME_P     = 'output_layer2'   # (128, 128, 1)
-NAME_MU_XY = 'output_layer1'   # (128, 128, 2)
+# eval_quant.py saves preds keyed by SEMANTIC name, not by Hailo's
+# `loca_pram/output_layerN`. We still assert channel counts here — a stale
+# preds_*.npy written by an older eval_quant.py, or a future DFC change,
+# would fail here rather than silently swap p and mu_xy.
+NAME_P     = 'p'         # last dim == 1
+NAME_MU_XY = 'mu_xy'     # last dim == 2
 
 
 def _load_postproc():
@@ -47,10 +50,18 @@ def _load_postproc():
 
 def _load_preds(path):
     obj = np.load(path, allow_pickle=True).item()
+    assert NAME_P in obj and NAME_MU_XY in obj, \
+        f"[load] {path}: expected keys {NAME_P!r} and {NAME_MU_XY!r}, got {list(obj.keys())}. "\
+        f"Re-run hailo/eval_quant.py — the format changed to semantic keys."
     p_nhwc  = obj[NAME_P]        # (N, 128, 128, 1)
     mu_nhwc = obj[NAME_MU_XY]    # (N, 128, 128, 2)
-    assert p_nhwc.shape[1:]  == (128, 128, 1), p_nhwc.shape
-    assert mu_nhwc.shape[1:] == (128, 128, 2), mu_nhwc.shape
+    # Channel count is the ONLY unambiguous cross-version invariant — assert it.
+    assert p_nhwc.ndim == 4 and p_nhwc.shape[1:]  == (128, 128, 1), \
+        f"[load] {path}: {NAME_P!r} shape {p_nhwc.shape}, expected (N,128,128,1)"
+    assert mu_nhwc.ndim == 4 and mu_nhwc.shape[1:] == (128, 128, 2), \
+        f"[load] {path}: {NAME_MU_XY!r} shape {mu_nhwc.shape}, expected (N,128,128,2)"
+    assert p_nhwc.shape[-1] == 1,  f"[load] {path}: p channels={p_nhwc.shape[-1]}, expected 1"
+    assert mu_nhwc.shape[-1] == 2, f"[load] {path}: mu_xy channels={mu_nhwc.shape[-1]}, expected 2"
     return p_nhwc, mu_nhwc
 
 

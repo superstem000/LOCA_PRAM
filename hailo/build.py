@@ -19,11 +19,12 @@ Artifacts produced (all under hailo/):
     loca_pram.hef                  after compile
 
 Notes:
-- `hailo parser onnx` (CLI) SEGFAULTS on this model. Python API works.
-- Hailo renames output layers, NOT in export order. Actual mapping (from the
-  profiler) — build.py PRINTS and ASSERTS this:
-      output_layer1  -> mu_xy  (128, 128, 2)
-      output_layer2  -> p      (128, 128, 1)
+- `hailo parser onnx` (the CLI) SEGFAULTS on this model. Python API works.
+- Hailo output layers are FULLY QUALIFIED (e.g. `loca_pram/output_layer1`),
+  and the ORDER IS REVERSED relative to ONNX export order. Verified via the
+  HAR: `.../output_layer1` has channels=2 (mu_xy), `.../output_layer2` has
+  channels=1 (p). Everywhere we consume outputs we key by *semantic* name
+  (mu_xy | p) resolved from channel count — never by index or by position.
 - Calibration data must be NHWC (N, 128, 128, 1) float32.
 
 NO TORCH imports here — DFC env doesn't have it and installing it would break
@@ -50,7 +51,9 @@ NOISE_TXT       = os.path.join(HERE, 'loca_pram_noise.txt')
 MODEL_NAME = 'loca_pram'
 HW_ARCH    = 'hailo8'
 
-# ---- expected output name → semantic mapping (verified at parse) ----
+# Bare (net-prefix-stripped) suffix -> (semantic name, expected shape without batch).
+# We derive the prefix at runtime from the runner's net name so renaming the
+# model doesn't silently break this map.
 EXPECTED_OUTPUT_MAP = {
     'output_layer1': ('mu_xy', (128, 128, 2)),
     'output_layer2': ('p',     (128, 128, 1)),
@@ -77,6 +80,61 @@ def _load_runner_from_har(har_path):
     return runner
 
 
+def _net_prefix(runner):
+    """Fully-qualified name prefix (e.g. 'loca_pram/'). Derived from the HN
+    dict's model/net name so renaming stays consistent."""
+    hn = runner.get_hn_dict()
+    # Try a few common places the net name lives across DFC versions.
+    name = hn.get('name') or hn.get('net_name') or hn.get('model_name') or MODEL_NAME
+    return f"{name}/"
+
+
+def resolve_outputs(runner):
+    """Return dict semantic_name -> fully_qualified_layer_name.
+
+    Two independent checks:
+      1. bare suffix must be in EXPECTED_OUTPUT_MAP
+      2. last-dim (channel count) must match the semantic expectation
+         (mu_xy=2, p=1). Channel count is the only unambiguous check —
+         name suffixes could shift between DFC versions.
+    """
+    hn = runner.get_hn_dict()
+    layers = hn.get('layers', {})
+    prefix = _net_prefix(runner)
+    outputs = [n for n, spec in layers.items() if spec.get('type') == 'output_layer']
+
+    resolved = {}   # semantic -> full name
+    for full_name in outputs:
+        suffix = full_name[len(prefix):] if full_name.startswith(prefix) else full_name
+        entry = EXPECTED_OUTPUT_MAP.get(suffix)
+        if entry is None:
+            raise AssertionError(
+                f"[resolve] unexpected output suffix {suffix!r} "
+                f"(full name {full_name!r}). "
+                f"Update EXPECTED_OUTPUT_MAP if the parser's naming changed."
+            )
+        sem, exp_shape = entry
+
+        raw_shape = layers[full_name].get('output_shapes', [[None]])[0]
+        # Drop batch dim if present (some DFC versions include it, some don't).
+        shape = tuple(raw_shape[1:] if len(raw_shape) == 4 else raw_shape)
+
+        # (a) full-shape check — sanity
+        assert shape == exp_shape, \
+            f"[resolve] {full_name} ({sem}) shape mismatch: got {shape}, expected {exp_shape}"
+        # (b) channel-count check — the only unambiguous cross-version invariant
+        expected_c = 2 if sem == 'mu_xy' else 1
+        assert shape[-1] == expected_c, \
+            f"[resolve] {full_name} channels={shape[-1]}, expected {expected_c} for {sem!r}"
+
+        resolved[sem] = full_name
+        print(f"[resolve]   {full_name}  ->  {sem}   shape={shape}   ✓")
+
+    assert 'p' in resolved and 'mu_xy' in resolved, \
+        f"[resolve] missing semantic outputs. got: {resolved}"
+    return resolved
+
+
 def cmd_parse():
     from hailo_sdk_client import ClientRunner
     assert os.path.isfile(ONNX_PATH), f"missing ONNX: {ONNX_PATH}"
@@ -87,30 +145,20 @@ def cmd_parse():
     runner.save_har(HAR_PARSED)
     print(f"[parse] wrote {HAR_PARSED}")
 
-    # Introspect I/O
-    hn_dict = runner.get_hn_dict() if hasattr(runner, 'get_hn_dict') else {}
-    net = hn_dict.get('layers', {}) if hn_dict else {}
-    inputs  = [name for name, spec in net.items() if spec.get('type') == 'input_layer']
-    outputs = [name for name, spec in net.items() if spec.get('type') == 'output_layer']
+    # Print raw input/output layer names, then resolve semantic mapping.
+    hn_dict = runner.get_hn_dict()
+    layers  = hn_dict.get('layers', {})
+    inputs  = [n for n, spec in layers.items() if spec.get('type') == 'input_layer']
+    outputs = [n for n, spec in layers.items() if spec.get('type') == 'output_layer']
+    prefix  = _net_prefix(runner)
+    print(f"[parse] net prefix:    {prefix!r}")
     print(f"[parse] input layers:  {inputs}")
     print(f"[parse] output layers: {outputs}")
 
-    # Assert output mapping. The order is: HN gives the shape metadata for each
-    # output_layer; we assert against EXPECTED_OUTPUT_MAP. If Hailo ever
-    # renames these differently, this fails LOUDLY.
-    for out_name in outputs:
-        spec = net[out_name]
-        shape = tuple(spec.get('output_shapes', [[None]])[0][1:])   # drop batch
-        expected = EXPECTED_OUTPUT_MAP.get(out_name)
-        if expected is None:
-            raise AssertionError(
-                f"[parse] unexpected output layer {out_name!r}. "
-                f"Update EXPECTED_OUTPUT_MAP if the parser's naming changed."
-            )
-        sem, exp_shape = expected
-        assert shape == exp_shape, \
-            f"[parse] {out_name} ({sem}) shape mismatch: got {shape}, expected {exp_shape}"
-        print(f"[parse]   {out_name} -> {sem}  shape={shape}  ✓")
+    resolved = resolve_outputs(runner)
+    print(f"[parse] semantic mapping:")
+    for sem, full in resolved.items():
+        print(f"[parse]   {sem:6s} = {full}")
 
     return runner
 
@@ -147,17 +195,12 @@ def cmd_analyze():
     runner = _load_runner_from_har(HAR_QUANTIZED)
     calib = np.load(CALIB_PATH)
 
-    # analyze_noise returns per-layer SNR (dB). API surface varies slightly
-    # across DFC versions; try common signatures.
     print(f"[analyze] running analyze_noise on {len(calib)} calib samples...")
     try:
         result = runner.analyze_noise(calib)
     except TypeError:
-        # older API — no arg
         result = runner.analyze_noise()
 
-    # Emit as a text file for reproducibility. Support multiple return shapes:
-    # dict-of-{layer: snr_db}, list of tuples, or a summary object.
     lines = []
     if isinstance(result, dict):
         items = sorted(result.items(), key=lambda kv: kv[1])

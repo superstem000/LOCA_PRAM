@@ -1,0 +1,19 @@
+model_optimization_flavor(optimization_level=4, compression_level=0)
+
+# Both flags set explicitly, on purpose:
+#
+# optimization_level=4
+#   Full pipeline: equalization + bias correction + Adaround + FT. Silently
+#   defaults to 0 (equalization only) when no GPU is detected. That fallback
+#   would look like "this model doesn't quantize well" — always assert on GPU
+#   presence at build time.
+#
+# compression_level=0
+#   No weight compression. We have huge FPS headroom and want accuracy. At
+#   4.2 M params the model is under Hailo's 20 M threshold and compression
+#   would auto-revert anyway.
+#
+# No normalization() command.
+#   normalize_tile() derives mean/std from each tile individually, so it's
+#   data-dependent and cannot be baked into fixed arrays. Normalization
+#   stays on the host.

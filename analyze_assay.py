@@ -4,15 +4,22 @@ Point it at a folder that contains `cycle_XXXX/` (or `demo_XXXX/`) subfolders
 of `.jpg` images and it writes:
 
     <data-dir>/analysis/
-      per_tile.csv                  one row per (cycle, tile)
-      summary_per_cycle.csv         one row per cycle
-      counts_over_time.png          mean ± std ribbon + per-cycle sum (twin axis)
-      per_tile_over_time.png        one line per tile + bold mean
-      boxplot_over_time.png         box & whisker of counts per cycle
-      spatial_heatmap_last_cycle.png  tile grid heatmap at final cycle
-                                    (skipped when filenames don't encode row/col)
-      cycle_0001/                   one PNG per image in that cycle:
-        <basename>.png              detections X-marked, count boxed top-center
+      per_tile.csv                      one row per (cycle, tile)
+      summary_per_cycle.csv             one row per cycle
+      counts_over_time.png              mean ± std ribbon + per-cycle sum
+      per_tile_over_time.png            one line per tile + bold mean
+      per_tile_over_time.html           interactive Plotly version — click a
+                                        legend entry to toggle a tile,
+                                        double-click to isolate it (hide
+                                        all others). Requires `plotly`.
+      per_tile_density_over_time.html   same but y = density (count / area)
+      boxplot_over_time.png             box & whisker of counts per cycle
+      spatial_heatmap_last_cycle.png    tile grid heatmap at final cycle
+                                        (skipped when filenames don't encode
+                                        row/col)
+      cycle_0001/                       one PNG per image in that cycle:
+        <basename>.png                  detections X-marked, count boxed
+                                        top-center
       cycle_0002/
       ...
 
@@ -24,6 +31,8 @@ Usage:
     python analyze_assay.py --data-dir /path/to/experiment --area 1.2
 
 Only --data-dir and --area are required. Everything else is defaulted.
+`plotly` is optional — install it (`pip install plotly`) to also get the
+interactive HTML plots; without it, only the PNGs are written.
 """
 
 from __future__ import annotations
@@ -486,6 +495,104 @@ def plot_per_tile_over_time(per_tile, out_path, thr, nms_k, tile_source):
     plt.close(fig)
 
 
+def plot_per_tile_over_time_html(per_tile, out_path, thr, nms_k, tile_source,
+                                 y_col="n_detections",
+                                 y_label="# detections per tile",
+                                 title="Per-tile detections over time"):
+    """Interactive Plotly HTML of per-tile trajectories over time.
+
+    Click a legend entry to toggle that tile; double-click to isolate it
+    (hide all others). Double-click again to show all. Legend is grouped
+    by tile-row when positions were parsed from filenames, plain sorted
+    list otherwise.
+
+    Returns True on success, False if the dataframe is empty or plotly
+    isn't installed (prints a hint in that case).
+    """
+    if len(per_tile) == 0:
+        return False
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print(f"    [skip] {os.path.basename(out_path)}: install plotly "
+              "(pip install plotly) to get the interactive HTML output.")
+        return False
+
+    tiles_df = (per_tile[["tile", "tile_row", "tile_col"]]
+                .drop_duplicates("tile"))
+    has_pos = tiles_df["tile_row"].notna().any()
+    if has_pos:
+        tiles_df = tiles_df.sort_values(["tile_row", "tile_col"])
+    else:
+        tiles_df = tiles_df.sort_values("tile")
+
+    fig = go.Figure()
+    hover_y = "%{y:.3f}" if y_col == "density" else "%{y:.0f}"
+
+    for _, r in tiles_df.iterrows():
+        tile = r["tile"]
+        g = per_tile[per_tile["tile"] == tile].sort_values("t_min")
+        if has_pos:
+            group = f"row {int(r['tile_row'])}"
+        else:
+            group = "tiles"
+        fig.add_trace(go.Scatter(
+            x=g["t_min"].tolist(),
+            y=g[y_col].tolist(),
+            mode="lines+markers",
+            name=str(tile),
+            legendgroup=group,
+            legendgrouptitle_text=group,
+            line=dict(width=1.2, color="steelblue"),
+            marker=dict(size=4),
+            opacity=0.55,
+            hovertemplate=(f"tile {tile}<br>"
+                           f"t=%{{x}} min<br>"
+                           f"{y_label}={hover_y}<extra></extra>"),
+        ))
+
+    mean_line = per_tile.groupby("t_min")[y_col].mean().sort_index()
+    fig.add_trace(go.Scatter(
+        x=mean_line.index.tolist(),
+        y=mean_line.values.tolist(),
+        mode="lines+markers",
+        name="MEAN across tiles",
+        line=dict(width=3.5, color="crimson"),
+        marker=dict(size=8),
+        hovertemplate=(f"MEAN<br>t=%{{x}} min<br>"
+                       f"{y_label}={hover_y}<extra></extra>"),
+    ))
+
+    fig.update_layout(
+        title=(f"{title}  "
+               f"({len(tiles_df)} tiles; tile id: {tile_source}; "
+               f"thr={thr}, nms={nms_k})"),
+        xaxis_title="time (min, first cycle = t=0)",
+        yaxis_title=y_label,
+        hovermode="closest",
+        template="plotly_white",
+        legend=dict(
+            orientation="v",
+            yanchor="top", y=1.0,
+            xanchor="left", x=1.02,
+            groupclick="toggleitem",
+        ),
+        margin=dict(r=200, b=110),
+    )
+    fig.add_annotation(
+        text=("<b>Tip:</b> click a legend entry to hide/show that tile. "
+              "<b>Double-click</b> to isolate it (hide all others); "
+              "double-click again to show all."),
+        xref="paper", yref="paper",
+        x=0.0, y=-0.18,
+        showarrow=False, align="left",
+        font=dict(size=11, color="dimgray"),
+    )
+
+    fig.write_html(str(out_path), include_plotlyjs=True, full_html=True)
+    return True
+
+
 def plot_boxplot_over_time(per_tile, out_path, thr, nms_k, minutes_per_cycle):
     if len(per_tile) == 0:
         return
@@ -677,6 +784,23 @@ def run(args):
     else:
         print("spatial_heatmap_last_cycle.png: skipped "
               "(no tile_<row>_<col>_ filenames found)")
+
+    if plot_per_tile_over_time_html(
+            per_tile,
+            os.path.join(analysis_dir, "per_tile_over_time.html"),
+            args.threshold, args.nms_kernel, tile_source,
+            y_col="n_detections",
+            y_label="# detections per tile",
+            title="Per-tile detections over time"):
+        print("wrote per_tile_over_time.html")
+    if plot_per_tile_over_time_html(
+            per_tile,
+            os.path.join(analysis_dir, "per_tile_density_over_time.html"),
+            args.threshold, args.nms_kernel, tile_source,
+            y_col="density",
+            y_label=f"density (count / {args.area_units})",
+            title="Per-tile density over time"):
+        print("wrote per_tile_density_over_time.html")
 
     print(f"\nall outputs in {analysis_dir}/")
 

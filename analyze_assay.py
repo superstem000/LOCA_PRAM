@@ -567,54 +567,63 @@ def discover_cycles(data_dir, image_ext):
     return out
 
 
-def run(args):
-    data_dir = os.path.abspath(args.data_dir)
-    if not os.path.isdir(data_dir):
-        sys.exit(f"error: --data-dir {data_dir} is not a directory")
+def resolve_model_path(user_path):
+    if os.path.isabs(user_path):
+        return user_path if os.path.isfile(user_path) else None
+    for c in (os.path.join(os.getcwd(), user_path),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), user_path)):
+        if os.path.isfile(c):
+            return c
+    return None
 
-    model_path = args.model_path
-    if not os.path.isabs(model_path):
-        candidates = [
-            os.path.join(os.getcwd(), model_path),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path),
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                model_path = c
-                break
-    if not os.path.isfile(model_path):
-        sys.exit(f"error: model file not found: {args.model_path}")
 
-    cycles = discover_cycles(data_dir, args.image_ext)
-    if not cycles:
-        sys.exit(f"error: no cycle_XXXX/demo_XXXX folders with "
-                 f"*{args.image_ext} images under {data_dir}")
-
-    print(f"data-dir : {data_dir}")
-    print(f"model    : {model_path}")
-    print(f"cycles   : {len(cycles)}  "
-          f"(images total: {sum(len(imgs) for _, imgs in cycles)})")
-    print(f"area     : {args.area} {args.area_units} per tile")
-    print(f"detector : threshold={args.threshold}, nms_kernel={args.nms_kernel}")
-
+def load_model(model_path):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"device   : {device}")
     model = GaussianMixtureModel(num_channels=1)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device).eval()
     (model._orig_mod if hasattr(model, "_orig_mod") else model).tanh_scale = 1.0
+    return model, device
+
+
+def discover_assays(root, image_ext):
+    """Every direct subdir of `root` that itself contains at least one
+    cycle_*/ or demo_*/ folder with images. Skips folders whose name is
+    literally 'analysis' (our own output)."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(root, "*"))):
+        if not os.path.isdir(d):
+            continue
+        if os.path.basename(d) == "analysis":
+            continue
+        if discover_cycles(d, image_ext):
+            out.append(d)
+    return out
+
+
+def analyze_one(model, device, data_dir, args):
+    """Run inference + analysis for a single assay directory."""
+    cycles = discover_cycles(data_dir, args.image_ext)
+    if not cycles:
+        print(f"[skip] {data_dir}: no cycle_XXXX/demo_XXXX folders with "
+              f"*{args.image_ext}")
+        return
+
+    print(f"\n=== {os.path.basename(data_dir)} ===")
+    print(f"  cycles: {len(cycles)}  "
+          f"(images total: {sum(len(imgs) for _, imgs in cycles)})")
 
     analysis_dir = os.path.join(data_dir, "analysis")
     os.makedirs(analysis_dir, exist_ok=True)
 
     rows = []
     t0 = time.time()
-    for cycle_dir, imgs in tqdm(cycles, desc="cycles"):
+    for cycle_dir, imgs in tqdm(cycles, desc="  cycles", leave=False):
         cycle_name = os.path.basename(cycle_dir)
         if not args.no_images:
             cycle_out = os.path.join(analysis_dir, cycle_name)
             os.makedirs(cycle_out, exist_ok=True)
-        for path in tqdm(imgs, desc=f"  {cycle_name}", leave=False):
+        for path in tqdm(imgs, desc=f"    {cycle_name}", leave=False):
             try:
                 img, cx, cy = infer_positions(
                     model, device, path,
@@ -637,10 +646,11 @@ def run(args):
                                  os.path.join(cycle_out, base))
 
     dt = time.time() - t0
-    print(f"\ninference done in {dt:.1f}s over {len(rows)} images")
+    print(f"  inference: {len(rows)} images in {dt:.1f}s")
 
     if not rows:
-        sys.exit("no images successfully processed — nothing to write")
+        print(f"  [skip] no images successfully processed in {data_dir}")
+        return
 
     rows_df = pd.DataFrame(rows)
     per_tile, summary, tile_source = build_per_tile_and_summary(
@@ -650,13 +660,10 @@ def run(args):
         minutes_per_cycle=args.minutes_per_cycle,
     )
 
-    per_tile_path = os.path.join(analysis_dir, "per_tile.csv")
-    summary_path = os.path.join(analysis_dir, "summary_per_cycle.csv")
-    per_tile.to_csv(per_tile_path, index=False)
-    summary.to_csv(summary_path, index=False)
-    print(f"wrote {per_tile_path}")
-    print(f"wrote {summary_path}")
-    print(f"tile source: {tile_source}")
+    per_tile.to_csv(os.path.join(analysis_dir, "per_tile.csv"), index=False)
+    summary.to_csv(os.path.join(analysis_dir, "summary_per_cycle.csv"),
+                    index=False)
+    print(f"  tile source: {tile_source}")
 
     plot_counts_over_time(summary,
                           os.path.join(analysis_dir, "counts_over_time.png"),
@@ -672,13 +679,49 @@ def run(args):
         per_tile,
         os.path.join(analysis_dir, "spatial_heatmap_last_cycle.png"),
         args.threshold, args.nms_kernel)
-    if heat_ok:
-        print("wrote spatial_heatmap_last_cycle.png")
-    else:
-        print("spatial_heatmap_last_cycle.png: skipped "
+    if not heat_ok:
+        print("  spatial_heatmap_last_cycle.png: skipped "
               "(no tile_<row>_<col>_ filenames found)")
 
-    print(f"\nall outputs in {analysis_dir}/")
+    print(f"  wrote outputs to {analysis_dir}/")
+
+
+def run(args):
+    if bool(args.data_dir) == bool(args.assays_root):
+        sys.exit("error: pass exactly one of --data-dir or --assays-root")
+
+    model_path = resolve_model_path(args.model_path)
+    if not model_path:
+        sys.exit(f"error: model file not found: {args.model_path}")
+
+    if args.assays_root:
+        root = os.path.abspath(args.assays_root)
+        if not os.path.isdir(root):
+            sys.exit(f"error: --assays-root {root} is not a directory")
+        targets = discover_assays(root, args.image_ext)
+        if not targets:
+            sys.exit(f"error: no subfolders under {root} contain "
+                     f"cycle_XXXX/demo_XXXX folders with *{args.image_ext}")
+    else:
+        target = os.path.abspath(args.data_dir)
+        if not os.path.isdir(target):
+            sys.exit(f"error: --data-dir {target} is not a directory")
+        targets = [target]
+
+    print(f"model    : {model_path}")
+    print(f"area     : {args.area} {args.area_units} per tile")
+    print(f"detector : threshold={args.threshold}, nms_kernel={args.nms_kernel}")
+    print(f"assays   : {len(targets)}")
+    for t in targets:
+        print(f"           - {t}")
+
+    model, device = load_model(model_path)
+    print(f"device   : {device}")
+
+    t_all = time.time()
+    for data_dir in targets:
+        analyze_one(model, device, data_dir, args)
+    print(f"\ntotal wall time: {time.time()-t_all:.1f}s over {len(targets)} assay(s)")
 
 
 def parse_args(argv=None):
@@ -686,8 +729,14 @@ def parse_args(argv=None):
         description="LOCA-PRAM standalone assay analyzer.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data-dir", required=True,
-                   help="Folder containing cycle_XXXX/ or demo_XXXX/ subfolders.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--data-dir",
+                     help="Single assay folder (containing cycle_XXXX/ or "
+                          "demo_XXXX/ subfolders).")
+    src.add_argument("--assays-root",
+                     help="Parent folder containing many assay subfolders; "
+                          "every direct subdir with cycle_*/demo_* inside "
+                          "is processed. Use this for a one-line batch run.")
     p.add_argument("--area", required=True, type=float,
                    help="Physical area of one image/tile FOV. Units are your "
                         "choice; density is reported as count / area.")

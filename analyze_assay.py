@@ -10,20 +10,23 @@ Two run modes:
    per_tile_density_over_time.html, and cycle_XXXX/<basename>.png per image.
 
 2) Batch across a root folder of assays (new):
-       python analyze_assay.py --assays-root <parent> --area 1.2 [--top-k K]
+       python analyze_assay.py --assays-root <parent> --area 1.2 \
+                                [--top-k K] [--middle-k K]
    Iterates every direct subfolder that contains cycle_*/demo_* dirs.
    Skips inference for assays that already have `analysis/per_tile.csv`
-   (use --force to re-run). When --top-k is set, additionally writes:
-     <assay>/analysis/summary_per_cycle_topK.csv
-     <assay>/analysis/counts_over_time_topK.png
-     <assay>/analysis/boxplot_over_time_topK.png
+   (use --force to re-run). --top-k picks the K highest-count tiles per
+   cycle; --middle-k picks the K tiles centered on the median. Either can
+   be set (or both — they're independent). Per assay, each writes:
+     <assay>/analysis/summary_per_cycle_{topK,middleK}.csv
+     <assay>/analysis/counts_over_time_{topK,middleK}.png
+     <assay>/analysis/boxplot_over_time_{topK,middleK}.png
    When any assay folder name starts with `NNN.N` (concentration),
    cross-assay concentration aggregation lands in `<assays-root>/analysis/`:
      per_concentration_per_cycle.csv
      counts_over_time_by_concentration.png
-   and, if --top-k is set:
-     per_concentration_per_cycle_topK.csv
-     counts_over_time_by_concentration_topK.png
+   and, mirrored for whichever subset flags are set:
+     per_concentration_per_cycle_{topK,middleK}.csv
+     counts_over_time_by_concentration_{topK,middleK}.png
 
 Detection settings (model, threshold, NMS kernel, forbidden mask, dedup)
 match `LOCA_PRAM_batch_assays_eval.ipynb` exactly, so counts are numerically
@@ -455,13 +458,35 @@ def top_k_per_cycle(per_tile, k):
     return pd.concat(picks, ignore_index=True) if picks else per_tile.iloc[0:0].copy()
 
 
-def build_summary_topk(per_tile_topk, per_tile_all, k):
-    """Per-cycle summary derived from the top-K subset."""
-    if len(per_tile_topk) == 0:
+def middle_k_per_cycle(per_tile, k):
+    """Take the middle K tiles by n_detections at each cycle (centered on
+    the median). Filters out both the low tail (imaging failures / empty
+    tiles) and the high tail (unusually hot tiles). When a cycle has
+    fewer than K tiles, all of them are kept."""
+    if k is None or len(per_tile) == 0:
+        return per_tile.iloc[0:0].copy()
+    picks = []
+    for cyc, g in per_tile.groupby("cycle"):
+        n = len(g)
+        if n <= k:
+            picks.append(g)
+            continue
+        g_sorted = g.sort_values("n_detections", kind="stable").reset_index(drop=True)
+        start = (n - k) // 2
+        picks.append(g_sorted.iloc[start:start + k])
+    return pd.concat(picks, ignore_index=True) if picks else per_tile.iloc[0:0].copy()
+
+
+def build_summary_from_subset(per_tile_subset, per_tile_all, k):
+    """Per-cycle summary derived from a K-tile subset (top-K, middle-K, ...).
+    Emits `n_tiles_used` (actual subset size at each cycle) and
+    `n_tiles_available` (total tiles at that cycle) so quality shifts are
+    visible."""
+    if len(per_tile_subset) == 0:
         return pd.DataFrame()
     available = (per_tile_all.groupby("cycle")["tile"].nunique()
                              .rename("n_tiles_available"))
-    summary = (per_tile_topk.groupby(["cycle", "t_min"], as_index=False)
+    summary = (per_tile_subset.groupby(["cycle", "t_min"], as_index=False)
                              .agg(n_tiles_used=("tile", "nunique"),
                                   detections_sum=("n_detections", "sum"),
                                   detections_mean=("n_detections", "mean"),
@@ -915,26 +940,30 @@ def write_baseline_outputs(rows_df, data_dir, args):
     return per_tile, summary, tile_source
 
 
-def write_topk_outputs(per_tile, data_dir, args):
-    """Compute top-K subset + summary; write topK CSV + counts/boxplot PNGs."""
-    if args.top_k is None:
+def write_subset_outputs(per_tile, data_dir, args, k, subset_fn,
+                          suffix, label):
+    """Write summary + counts/boxplot PNGs for a per-cycle K-tile subset.
+    `suffix` goes in filenames (e.g. `topK`, `middleK`); `label` goes in
+    plot titles (e.g. `top 10`, `middle 10`)."""
+    if k is None:
         return
     analysis_dir = os.path.join(data_dir, "analysis")
-    per_tile_topk = top_k_per_cycle(per_tile, args.top_k)
-    if len(per_tile_topk) == 0:
+    per_tile_subset = subset_fn(per_tile, k)
+    if len(per_tile_subset) == 0:
         return
-    summary_topk = build_summary_topk(per_tile_topk, per_tile, args.top_k)
-    summary_topk.to_csv(
-        os.path.join(analysis_dir, "summary_per_cycle_topK.csv"), index=False)
-    plot_counts_over_time(summary_topk,
-        os.path.join(analysis_dir, "counts_over_time_topK.png"),
+    summary = build_summary_from_subset(per_tile_subset, per_tile, k)
+    summary.to_csv(
+        os.path.join(analysis_dir, f"summary_per_cycle_{suffix}.csv"),
+        index=False)
+    plot_counts_over_time(summary,
+        os.path.join(analysis_dir, f"counts_over_time_{suffix}.png"),
         args.threshold, args.nms_kernel,
-        title=f"Detections over time — top {args.top_k}  "
+        title=f"Detections over time — {label}  "
               f"(thr={args.threshold}, nms={args.nms_kernel})")
-    plot_boxplot_over_time(per_tile_topk,
-        os.path.join(analysis_dir, "boxplot_over_time_topK.png"),
+    plot_boxplot_over_time(per_tile_subset,
+        os.path.join(analysis_dir, f"boxplot_over_time_{suffix}.png"),
         args.threshold, args.nms_kernel, args.minutes_per_cycle,
-        title=f"Detections over time — top {args.top_k}, box & whisker")
+        title=f"Detections over time — {label}, box & whisker")
 
 
 def process_assay(model_getter, data_dir, args):
@@ -962,8 +991,15 @@ def process_assay(model_getter, data_dir, args):
               f"(tile source: {tile_source})")
 
     if args.top_k is not None and len(per_tile) > 0:
-        write_topk_outputs(per_tile, data_dir, args)
+        write_subset_outputs(per_tile, data_dir, args, args.top_k,
+                              top_k_per_cycle, "topK", f"top {args.top_k}")
         print(f"[{assay_name}] wrote top-{args.top_k} outputs")
+
+    if args.middle_k is not None and len(per_tile) > 0:
+        write_subset_outputs(per_tile, data_dir, args, args.middle_k,
+                              middle_k_per_cycle, "middleK",
+                              f"middle {args.middle_k}")
+        print(f"[{assay_name}] wrote middle-{args.middle_k} outputs")
 
     return per_tile
 
@@ -1051,31 +1087,37 @@ def run(args):
                 print(f"wrote {root_analysis}/per_concentration_per_cycle.csv")
                 print(f"wrote {root_analysis}/counts_over_time_by_concentration.png")
 
-            if args.top_k is not None:
-                topk_entries = []
+            for k_val, subset_fn, suffix, label in (
+                (args.top_k, top_k_per_cycle, "topK", f"top {args.top_k}"),
+                (args.middle_k, middle_k_per_cycle, "middleK",
+                    f"middle {args.middle_k}"),
+            ):
+                if k_val is None:
+                    continue
+                subset_entries = []
                 for e in entries:
-                    topk_pt = top_k_per_cycle(e["per_tile"], args.top_k)
-                    if len(topk_pt):
-                        topk_entries.append({
+                    sub_pt = subset_fn(e["per_tile"], k_val)
+                    if len(sub_pt):
+                        subset_entries.append({
                             "assay":         e["assay"],
                             "concentration": e["concentration"],
-                            "per_tile":      topk_pt,
+                            "per_tile":      sub_pt,
                         })
-                per_conc_topk = build_per_concentration(
-                    topk_entries, args.area, args.area_units)
-                if len(per_conc_topk):
-                    per_conc_topk.to_csv(
+                per_conc_sub = build_per_concentration(
+                    subset_entries, args.area, args.area_units)
+                if len(per_conc_sub):
+                    per_conc_sub.to_csv(
                         os.path.join(root_analysis,
-                                      "per_concentration_per_cycle_topK.csv"),
+                                      f"per_concentration_per_cycle_{suffix}.csv"),
                         index=False)
                     plot_counts_over_time_by_concentration(
-                        per_conc_topk,
+                        per_conc_sub,
                         os.path.join(root_analysis,
-                                      "counts_over_time_by_concentration_topK.png"),
+                                      f"counts_over_time_by_concentration_{suffix}.png"),
                         args.threshold, args.nms_kernel,
-                        title_suffix=f"  (top {args.top_k})")
-                    print(f"wrote per_concentration_per_cycle_topK.csv")
-                    print(f"wrote counts_over_time_by_concentration_topK.png")
+                        title_suffix=f"  ({label})")
+                    print(f"wrote per_concentration_per_cycle_{suffix}.csv")
+                    print(f"wrote counts_over_time_by_concentration_{suffix}.png")
 
     print(f"\ntotal wall time: {time.time()-t_all:.1f}s")
 
@@ -1122,6 +1164,13 @@ def parse_args(argv=None):
                         "and boxplot_over_time_topK.png. Under --assays-root, "
                         "matching per-concentration top-K outputs are also "
                         "written.")
+    p.add_argument("--middle-k", type=int, default=None,
+                   help="If set, additionally produce middle-K aggregation: "
+                        "the K tiles centered on the median at each cycle "
+                        "(filters both the bottom tail of imaging failures "
+                        "and the top tail of unusually hot tiles). Files "
+                        "mirror --top-k with `_middleK` suffix. Can be used "
+                        "together with --top-k.")
     p.add_argument("--force", action="store_true",
                    help="Under --assays-root, re-run inference and baseline "
                         "analysis even when analysis/per_tile.csv already "

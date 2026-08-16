@@ -1,36 +1,34 @@
 """Standalone LOCA-PRAM assay analyzer.
 
-Point it at a folder that contains `cycle_XXXX/` (or `demo_XXXX/`) subfolders
-of `.jpg` images and it writes:
+Two run modes:
 
-    <data-dir>/analysis/
-      per_tile.csv                      one row per (cycle, tile)
-      summary_per_cycle.csv             one row per cycle
-      counts_over_time.png              mean ± std ribbon + per-cycle sum
-      per_tile_over_time.png            one line per tile + bold mean
-      per_tile_over_time.html           interactive Plotly version — click a
-                                        legend entry to toggle a tile,
-                                        double-click to isolate it (hide
-                                        all others). Requires `plotly`.
-      per_tile_density_over_time.html   same but y = density (count / area)
-      boxplot_over_time.png             box & whisker of counts per cycle
-      spatial_heatmap_last_cycle.png    tile grid heatmap at final cycle
-                                        (skipped when filenames don't encode
-                                        row/col)
-      cycle_0001/                       one PNG per image in that cycle:
-        <basename>.png                  detections X-marked, count boxed
-                                        top-center
-      cycle_0002/
-      ...
+1) Single assay (existing):
+       python analyze_assay.py --data-dir <one_assay_folder> --area 1.2
+   Writes into `<data-dir>/analysis/` — per_tile.csv, summary_per_cycle.csv,
+   counts_over_time.png, per_tile_over_time.png, boxplot_over_time.png,
+   spatial_heatmap_last_cycle.png, per_tile_over_time.html,
+   per_tile_density_over_time.html, and cycle_XXXX/<basename>.png per image.
+
+2) Batch across a root folder of assays (new):
+       python analyze_assay.py --assays-root <parent> --area 1.2 [--top-k K]
+   Iterates every direct subfolder that contains cycle_*/demo_* dirs.
+   Skips inference for assays that already have `analysis/per_tile.csv`
+   (use --force to re-run). When --top-k is set, additionally writes:
+     <assay>/analysis/summary_per_cycle_topK.csv
+     <assay>/analysis/counts_over_time_topK.png
+     <assay>/analysis/boxplot_over_time_topK.png
+   When any assay folder name starts with `NNN.N` (concentration),
+   cross-assay concentration aggregation lands in `<assays-root>/analysis/`:
+     per_concentration_per_cycle.csv
+     counts_over_time_by_concentration.png
+   and, if --top-k is set:
+     per_concentration_per_cycle_topK.csv
+     counts_over_time_by_concentration_topK.png
 
 Detection settings (model, threshold, NMS kernel, forbidden mask, dedup)
 match `LOCA_PRAM_batch_assays_eval.ipynb` exactly, so counts are numerically
 identical to that notebook at the same defaults.
 
-Usage:
-    python analyze_assay.py --data-dir /path/to/experiment --area 1.2
-
-Only --data-dir and --area are required. Everything else is defaulted.
 `plotly` is optional — install it (`pip install plotly`) to also get the
 interactive HTML plots; without it, only the PNGs are written.
 """
@@ -285,12 +283,10 @@ def dedup_positions(positions, radius=DEDUP_RADIUS_NATIVE):
 def infer_positions(model, device, path, threshold, nms_kernel,
                     overlap_native=OVERLAP_NATIVE,
                     dedup_radius=DEDUP_RADIUS_NATIVE):
-    """One inference pass returning (native_image, cx, cy).
-
-    Same tiled + edge-rejected + cross-tile-deduped path as the notebook's
+    """One inference pass returning (native_image, cx, cy). Same tiled +
+    edge-rejected + cross-tile-deduped path as the notebook's
     `detect_for_viz`; identical numeric behavior at matching (threshold,
-    nms_kernel).
-    """
+    nms_kernel)."""
     img = load_real_native(path)
     h, w = img.shape
     stride_y = NATIVE_WINDOW[0] - overlap_native
@@ -330,6 +326,7 @@ def infer_positions(model, device, path, threshold, nms_kernel,
 # =============================================================================
 _TILE_RE = re.compile(r"tile_(\d+)_(\d+)_", re.IGNORECASE)
 _CYCLE_RE = re.compile(r"(?:cycle|demo)_(\d+)", re.IGNORECASE)
+_CONC_RE = re.compile(r"^(\d+\.\d+)")
 
 
 def parse_tile_pos(filename):
@@ -342,14 +339,19 @@ def parse_cycle_num(demo_name):
     return int(m.group(1)) if m else None
 
 
+def parse_concentration(assay_name):
+    """`006.0_batch_A` -> '006.0'. Returns None if the folder name doesn't
+    start with a decimal number."""
+    m = _CONC_RE.match(os.path.basename(assay_name))
+    return m.group(1) if m else None
+
+
 # =============================================================================
 # Rendering
 # =============================================================================
 def render_annotated(img, cx, cy, count, out_path,
                      marker_px=24, marker_lw=2):
-    """Write a PNG of `img` with detections X-marked and a count box at
-    top-center. Count box is opaque black with white text so it never
-    gets confused with the image itself."""
+    """PNG of `img` with detections X-marked and a count box at top-center."""
     p_lo, p_hi = np.percentile(img, [1, 99])
     norm = np.clip((img - p_lo) / (p_hi - p_lo + 1e-9), 0, 1)
     bgr = cv2.cvtColor((norm * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
@@ -381,7 +383,7 @@ def render_annotated(img, cx, cy, count, out_path,
 
 
 # =============================================================================
-# Analysis
+# Analysis — baseline
 # =============================================================================
 def build_per_tile_and_summary(rows_df, area_per_tile, area_units,
                                minutes_per_cycle):
@@ -439,9 +441,89 @@ def build_per_tile_and_summary(rows_df, area_per_tile, area_units,
 
 
 # =============================================================================
-# Visualizations
+# Analysis — top-K
 # =============================================================================
-def plot_counts_over_time(summary, out_path, thr, nms_k):
+def top_k_per_cycle(per_tile, k):
+    """Take the top K tiles by n_detections at each cycle. Returns a df with
+    the same columns as per_tile. When a cycle has fewer than K tiles, all
+    of them are kept (`n_tiles_used` in the summary records the actual K)."""
+    if k is None or len(per_tile) == 0:
+        return per_tile.iloc[0:0].copy()
+    picks = []
+    for cyc, g in per_tile.groupby("cycle"):
+        picks.append(g.nlargest(min(k, len(g)), "n_detections"))
+    return pd.concat(picks, ignore_index=True) if picks else per_tile.iloc[0:0].copy()
+
+
+def build_summary_topk(per_tile_topk, per_tile_all, k):
+    """Per-cycle summary derived from the top-K subset."""
+    if len(per_tile_topk) == 0:
+        return pd.DataFrame()
+    available = (per_tile_all.groupby("cycle")["tile"].nunique()
+                             .rename("n_tiles_available"))
+    summary = (per_tile_topk.groupby(["cycle", "t_min"], as_index=False)
+                             .agg(n_tiles_used=("tile", "nunique"),
+                                  detections_sum=("n_detections", "sum"),
+                                  detections_mean=("n_detections", "mean"),
+                                  detections_std=("n_detections", "std"),
+                                  density_mean=("density", "mean"),
+                                  density_std=("density", "std")))
+    summary["k_requested"] = int(k)
+    summary = summary.merge(available.reset_index(), on="cycle", how="left")
+    cols = ["cycle", "t_min", "k_requested", "n_tiles_used",
+            "n_tiles_available", "detections_sum", "detections_mean",
+            "detections_std", "density_mean", "density_std"]
+    return summary[cols].sort_values("cycle").reset_index(drop=True)
+
+
+# =============================================================================
+# Analysis — per concentration (cross-assay)
+# =============================================================================
+def build_per_concentration(entries, area_per_tile, area_units):
+    """entries: list of {'assay': str, 'concentration': str, 'per_tile': df}.
+    Pools tiles across assays sharing a concentration; returns one row per
+    (concentration, cycle) with count/density stats. Density is recomputed
+    from n_detections with the current --area so units are consistent even
+    if per_tile.csv came from a run with a different area setting."""
+    if not entries:
+        return pd.DataFrame()
+    by_conc = {}
+    for e in entries:
+        df = e["per_tile"].copy()
+        df["assay"] = e["assay"]
+        df["density"] = df["n_detections"] / area_per_tile
+        by_conc.setdefault(e["concentration"], []).append(df)
+
+    rows = []
+    for conc, dfs in by_conc.items():
+        pooled = pd.concat(dfs, ignore_index=True)
+        for (cycle, t_min), g in pooled.groupby(["cycle", "t_min"]):
+            rows.append({
+                "concentration":     conc,
+                "cycle":             int(cycle),
+                "t_min":             float(t_min),
+                "n_assays":          int(g["assay"].nunique()),
+                "n_tiles":           int(len(g)),
+                "detections_sum":    int(g["n_detections"].sum()),
+                "detections_mean":   float(g["n_detections"].mean()),
+                "detections_std":    float(g["n_detections"].std()),
+                "detections_median": float(g["n_detections"].median()),
+                "density_mean":      float(g["density"].mean()),
+                "density_std":       float(g["density"].std()),
+                "area_per_tile":     area_per_tile,
+                "area_units":        area_units,
+            })
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+              .sort_values(["concentration", "cycle"])
+              .reset_index(drop=True))
+
+
+# =============================================================================
+# Visualizations — baseline
+# =============================================================================
+def plot_counts_over_time(summary, out_path, thr, nms_k, title=None):
     """Mean ± std ribbon across tiles + per-cycle sum on twin axis."""
     if len(summary) == 0:
         return
@@ -466,7 +548,7 @@ def plot_counts_over_time(summary, out_path, thr, nms_k):
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
-    ax.set_title(f"Detections over time  (thr={thr}, nms={nms_k})")
+    ax.set_title(title or f"Detections over time  (thr={thr}, nms={nms_k})")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -499,16 +581,8 @@ def plot_per_tile_over_time_html(per_tile, out_path, thr, nms_k, tile_source,
                                  y_col="n_detections",
                                  y_label="# detections per tile",
                                  title="Per-tile detections over time"):
-    """Interactive Plotly HTML of per-tile trajectories over time.
-
-    Click a legend entry to toggle that tile; double-click to isolate it
-    (hide all others). Double-click again to show all. Legend is grouped
-    by tile-row when positions were parsed from filenames, plain sorted
-    list otherwise.
-
-    Returns True on success, False if the dataframe is empty or plotly
-    isn't installed (prints a hint in that case).
-    """
+    """Interactive Plotly HTML. Click legend to toggle a tile, double-click
+    to isolate it. Skipped silently if plotly isn't installed."""
     if len(per_tile) == 0:
         return False
     try:
@@ -593,7 +667,8 @@ def plot_per_tile_over_time_html(per_tile, out_path, thr, nms_k, tile_source,
     return True
 
 
-def plot_boxplot_over_time(per_tile, out_path, thr, nms_k, minutes_per_cycle):
+def plot_boxplot_over_time(per_tile, out_path, thr, nms_k, minutes_per_cycle,
+                           title=None):
     if len(per_tile) == 0:
         return
     by_t = per_tile.groupby("t_min")["n_detections"].apply(list)
@@ -605,7 +680,7 @@ def plot_boxplot_over_time(per_tile, out_path, thr, nms_k, minutes_per_cycle):
                showmeans=True, meanline=True)
     ax.set_xlabel("time (min, first cycle = t=0)")
     ax.set_ylabel(f"# detections per tile  (thr={thr}, nms={nms_k})")
-    ax.set_title("Detections over time — box & whisker")
+    ax.set_title(title or "Detections over time — box & whisker")
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
@@ -659,6 +734,47 @@ def plot_spatial_heatmap_last_cycle(per_tile, out_path, thr, nms_k):
 
 
 # =============================================================================
+# Visualizations — concentration
+# =============================================================================
+def plot_counts_over_time_by_concentration(per_conc, out_path, thr, nms_k,
+                                            title_suffix=""):
+    """One line per concentration, mean-vs-time, with ±std ribbon per line
+    and per-cycle sum on twin axis (dashed)."""
+    if len(per_conc) == 0:
+        return
+    concs = sorted(per_conc["concentration"].unique(),
+                   key=lambda c: float(c))
+    cmap = plt.get_cmap("viridis", max(len(concs), 2))
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax2 = ax.twinx()
+    for i, c in enumerate(concs):
+        g = per_conc[per_conc["concentration"] == c].sort_values("t_min")
+        col = cmap(i)
+        n_assays = int(g["n_assays"].max())
+        ax.plot(g["t_min"], g["detections_mean"], "-o", color=col, lw=2,
+                label=f"{c}  (n_assays={n_assays})")
+        s = g["detections_std"].fillna(0)
+        ax.fill_between(g["t_min"],
+                        g["detections_mean"] - s,
+                        g["detections_mean"] + s,
+                        alpha=0.12, color=col)
+        ax2.plot(g["t_min"], g["detections_sum"], "--", color=col,
+                 lw=1.0, alpha=0.7)
+    ax.set_xlabel("time (min, first cycle = t=0)")
+    ax.set_ylabel("mean # detections per tile (across pooled tiles)")
+    ax2.set_ylabel("sum # detections across pooled tiles (dashed)",
+                   fontsize=9, color="dimgray")
+    ax2.tick_params(axis="y", labelsize=8, colors="dimgray")
+    ax.set_title(f"Detections over time by concentration{title_suffix}  "
+                 f"(thr={thr}, nms={nms_k})")
+    ax.legend(title="concentration", fontsize=9, loc="best")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
 # Driver
 # =============================================================================
 def discover_cycles(data_dir, image_ext):
@@ -674,54 +790,59 @@ def discover_cycles(data_dir, image_ext):
     return out
 
 
-def run(args):
-    data_dir = os.path.abspath(args.data_dir)
-    if not os.path.isdir(data_dir):
-        sys.exit(f"error: --data-dir {data_dir} is not a directory")
+def discover_assays(root, image_ext):
+    """Every direct subdir of `root` that contains at least one cycle_*/demo_*
+    folder with images. Skips any subfolder named literally 'analysis' (our
+    own output at the root level)."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(root, "*"))):
+        if not os.path.isdir(d):
+            continue
+        if os.path.basename(d) == "analysis":
+            continue
+        if discover_cycles(d, image_ext):
+            out.append(d)
+    return out
 
-    model_path = args.model_path
-    if not os.path.isabs(model_path):
-        candidates = [
-            os.path.join(os.getcwd(), model_path),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path),
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                model_path = c
-                break
-    if not os.path.isfile(model_path):
-        sys.exit(f"error: model file not found: {args.model_path}")
 
-    cycles = discover_cycles(data_dir, args.image_ext)
-    if not cycles:
-        sys.exit(f"error: no cycle_XXXX/demo_XXXX folders with "
-                 f"*{args.image_ext} images under {data_dir}")
+def resolve_model_path(user_path):
+    if os.path.isabs(user_path):
+        return user_path if os.path.isfile(user_path) else None
+    for c in (os.path.join(os.getcwd(), user_path),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), user_path)):
+        if os.path.isfile(c):
+            return c
+    return None
 
-    print(f"data-dir : {data_dir}")
-    print(f"model    : {model_path}")
-    print(f"cycles   : {len(cycles)}  "
-          f"(images total: {sum(len(imgs) for _, imgs in cycles)})")
-    print(f"area     : {args.area} {args.area_units} per tile")
-    print(f"detector : threshold={args.threshold}, nms_kernel={args.nms_kernel}")
 
+def load_model(model_path):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"device   : {device}")
     model = GaussianMixtureModel(num_channels=1)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device).eval()
     (model._orig_mod if hasattr(model, "_orig_mod") else model).tanh_scale = 1.0
+    return model, device
+
+
+def infer_assay(model, device, data_dir, args):
+    """Run inference on every image in every cycle folder under data_dir.
+    Writes per-image annotated PNGs (unless --no-images). Returns the raw
+    one-row-per-image DataFrame."""
+    cycles = discover_cycles(data_dir, args.image_ext)
+    if not cycles:
+        return pd.DataFrame()
 
     analysis_dir = os.path.join(data_dir, "analysis")
     os.makedirs(analysis_dir, exist_ok=True)
 
     rows = []
     t0 = time.time()
-    for cycle_dir, imgs in tqdm(cycles, desc="cycles"):
+    for cycle_dir, imgs in tqdm(cycles, desc=f"  cycles", leave=False):
         cycle_name = os.path.basename(cycle_dir)
         if not args.no_images:
             cycle_out = os.path.join(analysis_dir, cycle_name)
             os.makedirs(cycle_out, exist_ok=True)
-        for path in tqdm(imgs, desc=f"  {cycle_name}", leave=False):
+        for path in tqdm(imgs, desc=f"    {cycle_name}", leave=False):
             try:
                 img, cx, cy = infer_positions(
                     model, device, path,
@@ -742,28 +863,26 @@ def run(args):
                 base = os.path.splitext(os.path.basename(path))[0] + ".png"
                 render_annotated(img, cx, cy, n,
                                  os.path.join(cycle_out, base))
-
     dt = time.time() - t0
-    print(f"\ninference done in {dt:.1f}s over {len(rows)} images")
+    print(f"    inference: {len(rows)} images in {dt:.1f}s")
+    return pd.DataFrame(rows)
 
-    if not rows:
-        sys.exit("no images successfully processed — nothing to write")
 
-    rows_df = pd.DataFrame(rows)
+def write_baseline_outputs(rows_df, data_dir, args):
+    """Compute per_tile + summary, write baseline CSVs, PNGs, and HTMLs.
+    Returns (per_tile, summary, tile_source)."""
+    analysis_dir = os.path.join(data_dir, "analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+
     per_tile, summary, tile_source = build_per_tile_and_summary(
         rows_df,
         area_per_tile=args.area,
         area_units=args.area_units,
         minutes_per_cycle=args.minutes_per_cycle,
     )
-
-    per_tile_path = os.path.join(analysis_dir, "per_tile.csv")
-    summary_path = os.path.join(analysis_dir, "summary_per_cycle.csv")
-    per_tile.to_csv(per_tile_path, index=False)
-    summary.to_csv(summary_path, index=False)
-    print(f"wrote {per_tile_path}")
-    print(f"wrote {summary_path}")
-    print(f"tile source: {tile_source}")
+    per_tile.to_csv(os.path.join(analysis_dir, "per_tile.csv"), index=False)
+    summary.to_csv(os.path.join(analysis_dir, "summary_per_cycle.csv"),
+                    index=False)
 
     plot_counts_over_time(summary,
                           os.path.join(analysis_dir, "counts_over_time.png"),
@@ -775,34 +894,190 @@ def run(args):
                            os.path.join(analysis_dir, "boxplot_over_time.png"),
                            args.threshold, args.nms_kernel,
                            args.minutes_per_cycle)
-    heat_ok = plot_spatial_heatmap_last_cycle(
+    plot_spatial_heatmap_last_cycle(
         per_tile,
         os.path.join(analysis_dir, "spatial_heatmap_last_cycle.png"),
         args.threshold, args.nms_kernel)
-    if heat_ok:
-        print("wrote spatial_heatmap_last_cycle.png")
+    plot_per_tile_over_time_html(
+        per_tile,
+        os.path.join(analysis_dir, "per_tile_over_time.html"),
+        args.threshold, args.nms_kernel, tile_source,
+        y_col="n_detections",
+        y_label="# detections per tile",
+        title="Per-tile detections over time")
+    plot_per_tile_over_time_html(
+        per_tile,
+        os.path.join(analysis_dir, "per_tile_density_over_time.html"),
+        args.threshold, args.nms_kernel, tile_source,
+        y_col="density",
+        y_label=f"density (count / {args.area_units})",
+        title="Per-tile density over time")
+    return per_tile, summary, tile_source
+
+
+def write_topk_outputs(per_tile, data_dir, args):
+    """Compute top-K subset + summary; write topK CSV + counts/boxplot PNGs."""
+    if args.top_k is None:
+        return
+    analysis_dir = os.path.join(data_dir, "analysis")
+    per_tile_topk = top_k_per_cycle(per_tile, args.top_k)
+    if len(per_tile_topk) == 0:
+        return
+    summary_topk = build_summary_topk(per_tile_topk, per_tile, args.top_k)
+    summary_topk.to_csv(
+        os.path.join(analysis_dir, "summary_per_cycle_topK.csv"), index=False)
+    plot_counts_over_time(summary_topk,
+        os.path.join(analysis_dir, "counts_over_time_topK.png"),
+        args.threshold, args.nms_kernel,
+        title=f"Detections over time — top {args.top_k}  "
+              f"(thr={args.threshold}, nms={args.nms_kernel})")
+    plot_boxplot_over_time(per_tile_topk,
+        os.path.join(analysis_dir, "boxplot_over_time_topK.png"),
+        args.threshold, args.nms_kernel, args.minutes_per_cycle,
+        title=f"Detections over time — top {args.top_k}, box & whisker")
+
+
+def process_assay(model_getter, data_dir, args):
+    """Full end-to-end for one assay. Skips inference and baseline outputs
+    if `analysis/per_tile.csv` already exists (unless --force). Always
+    (re)runs the top-K step when --top-k is set. Returns the per_tile
+    DataFrame (or None if unavailable)."""
+    assay_name = os.path.basename(data_dir)
+    analysis_dir = os.path.join(data_dir, "analysis")
+    per_tile_path = os.path.join(analysis_dir, "per_tile.csv")
+
+    if os.path.isfile(per_tile_path) and not args.force:
+        print(f"[{assay_name}] baseline analysis exists — loading per_tile.csv")
+        per_tile = pd.read_csv(per_tile_path)
     else:
-        print("spatial_heatmap_last_cycle.png: skipped "
-              "(no tile_<row>_<col>_ filenames found)")
+        model, device = model_getter()
+        print(f"[{assay_name}] running inference")
+        rows_df = infer_assay(model, device, data_dir, args)
+        if len(rows_df) == 0:
+            print(f"[{assay_name}] no images processed")
+            return None
+        per_tile, _, tile_source = write_baseline_outputs(
+            rows_df, data_dir, args)
+        print(f"[{assay_name}] wrote baseline outputs "
+              f"(tile source: {tile_source})")
 
-    if plot_per_tile_over_time_html(
-            per_tile,
-            os.path.join(analysis_dir, "per_tile_over_time.html"),
-            args.threshold, args.nms_kernel, tile_source,
-            y_col="n_detections",
-            y_label="# detections per tile",
-            title="Per-tile detections over time"):
-        print("wrote per_tile_over_time.html")
-    if plot_per_tile_over_time_html(
-            per_tile,
-            os.path.join(analysis_dir, "per_tile_density_over_time.html"),
-            args.threshold, args.nms_kernel, tile_source,
-            y_col="density",
-            y_label=f"density (count / {args.area_units})",
-            title="Per-tile density over time"):
-        print("wrote per_tile_density_over_time.html")
+    if args.top_k is not None and len(per_tile) > 0:
+        write_topk_outputs(per_tile, data_dir, args)
+        print(f"[{assay_name}] wrote top-{args.top_k} outputs")
 
-    print(f"\nall outputs in {analysis_dir}/")
+    return per_tile
+
+
+def run(args):
+    # --- source selection ---
+    if bool(args.data_dir) == bool(args.assays_root):
+        sys.exit("error: pass exactly one of --data-dir or --assays-root")
+
+    model_path = resolve_model_path(args.model_path)
+    if not model_path:
+        sys.exit(f"error: model file not found: {args.model_path}")
+
+    if args.assays_root:
+        root = os.path.abspath(args.assays_root)
+        if not os.path.isdir(root):
+            sys.exit(f"error: --assays-root {root} is not a directory")
+        targets = discover_assays(root, args.image_ext)
+        if not targets:
+            sys.exit(f"error: no assay subfolders under {root}")
+    else:
+        target = os.path.abspath(args.data_dir)
+        if not os.path.isdir(target):
+            sys.exit(f"error: --data-dir {target} is not a directory")
+        targets = [target]
+        root = None
+
+    # --- header ---
+    print(f"model    : {model_path}")
+    print(f"area     : {args.area} {args.area_units} per tile")
+    print(f"detector : threshold={args.threshold}, nms_kernel={args.nms_kernel}")
+    if args.top_k is not None:
+        print(f"top-K    : {args.top_k} tiles per cycle")
+    if root is not None:
+        print(f"root     : {root}")
+    print(f"assays   : {len(targets)}")
+    for t in targets:
+        print(f"           - {os.path.basename(t)}")
+
+    # --- lazy model loader (only loads if any assay needs inference) ---
+    _cached = {"model": None, "device": None}
+
+    def get_model():
+        if _cached["model"] is None:
+            _cached["model"], _cached["device"] = load_model(model_path)
+            print(f"loaded model on {_cached['device']}")
+        return _cached["model"], _cached["device"]
+
+    # --- per-assay pass ---
+    entries = []
+    t_all = time.time()
+    for data_dir in targets:
+        per_tile = process_assay(get_model, data_dir, args)
+        if per_tile is None or len(per_tile) == 0:
+            continue
+        if root is not None:
+            conc = parse_concentration(os.path.basename(data_dir))
+            if conc is not None:
+                entries.append({
+                    "assay":         os.path.basename(data_dir),
+                    "concentration": conc,
+                    "per_tile":      per_tile,
+                })
+
+    # --- per-concentration pass (only under --assays-root) ---
+    if root is not None:
+        matched = len(entries)
+        skipped = len(targets) - matched
+        print(f"\nconcentration parsing: matched {matched}/{len(targets)} assays"
+              + (f"; {skipped} skipped (no NNN.N prefix)" if skipped else ""))
+
+        if matched > 0:
+            root_analysis = os.path.join(root, "analysis")
+            os.makedirs(root_analysis, exist_ok=True)
+
+            per_conc = build_per_concentration(entries, args.area, args.area_units)
+            if len(per_conc):
+                per_conc.to_csv(
+                    os.path.join(root_analysis, "per_concentration_per_cycle.csv"),
+                    index=False)
+                plot_counts_over_time_by_concentration(
+                    per_conc,
+                    os.path.join(root_analysis, "counts_over_time_by_concentration.png"),
+                    args.threshold, args.nms_kernel)
+                print(f"wrote {root_analysis}/per_concentration_per_cycle.csv")
+                print(f"wrote {root_analysis}/counts_over_time_by_concentration.png")
+
+            if args.top_k is not None:
+                topk_entries = []
+                for e in entries:
+                    topk_pt = top_k_per_cycle(e["per_tile"], args.top_k)
+                    if len(topk_pt):
+                        topk_entries.append({
+                            "assay":         e["assay"],
+                            "concentration": e["concentration"],
+                            "per_tile":      topk_pt,
+                        })
+                per_conc_topk = build_per_concentration(
+                    topk_entries, args.area, args.area_units)
+                if len(per_conc_topk):
+                    per_conc_topk.to_csv(
+                        os.path.join(root_analysis,
+                                      "per_concentration_per_cycle_topK.csv"),
+                        index=False)
+                    plot_counts_over_time_by_concentration(
+                        per_conc_topk,
+                        os.path.join(root_analysis,
+                                      "counts_over_time_by_concentration_topK.png"),
+                        args.threshold, args.nms_kernel,
+                        title_suffix=f"  (top {args.top_k})")
+                    print(f"wrote per_concentration_per_cycle_topK.csv")
+                    print(f"wrote counts_over_time_by_concentration_topK.png")
+
+    print(f"\ntotal wall time: {time.time()-t_all:.1f}s")
 
 
 def parse_args(argv=None):
@@ -810,8 +1085,16 @@ def parse_args(argv=None):
         description="LOCA-PRAM standalone assay analyzer.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data-dir", required=True,
-                   help="Folder containing cycle_XXXX/ or demo_XXXX/ subfolders.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--data-dir",
+                     help="Single assay folder (containing cycle_XXXX/ or "
+                          "demo_XXXX/ subfolders).")
+    src.add_argument("--assays-root",
+                     help="Parent folder containing many assay subfolders; "
+                          "every direct subdir with cycle_*/demo_* inside "
+                          "is processed. Concentration aggregation runs "
+                          "automatically for subfolders whose names start "
+                          "with `NNN.N` (e.g. `006.0_...`).")
     p.add_argument("--area", required=True, type=float,
                    help="Physical area of one image/tile FOV. Units are your "
                         "choice; density is reported as count / area.")
@@ -832,6 +1115,17 @@ def parse_args(argv=None):
     p.add_argument("--no-images", action="store_true",
                    help="Skip per-image annotated PNG output "
                         "(CSVs and summary plots still get written).")
+    p.add_argument("--top-k", type=int, default=None,
+                   help="If set, additionally produce top-K aggregation: the "
+                        "K highest-count tiles at each cycle are pooled into "
+                        "summary_per_cycle_topK.csv, counts_over_time_topK.png, "
+                        "and boxplot_over_time_topK.png. Under --assays-root, "
+                        "matching per-concentration top-K outputs are also "
+                        "written.")
+    p.add_argument("--force", action="store_true",
+                   help="Under --assays-root, re-run inference and baseline "
+                        "analysis even when analysis/per_tile.csv already "
+                        "exists.")
     return p.parse_args(argv)
 
 

@@ -59,17 +59,45 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 # =============================================================================
-# Model architecture (verbatim from LOCA_PRAM_batch_assays_eval.ipynb)
+# Model architecture — v9 batchnorm variant with split heads
+# (mirrors NORM='batch' cell in LOCA_PRAM_main_downsampled.ipynb)
+#
+# Key differences from the pre-v9 GroupNorm build:
+#   - BatchNorm2d in every conv_block / multi_head norm slot (switchable via
+#     NORM); conv layers before a norm now use bias=False.
+#   - The old 3-channel mu head is split into head_mu_xy (2ch, tanh-scaled)
+#     and head_mu_a (1ch, sigmoid*100). p, sigma, bg are also named heads.
+#   - tanh_scale = 6.0 (final training value; was 1.0 pre-v9).
+#   - pxy_std = sigmoid(sigma) * 2.4 + 0.1  (was * 1.4 + 0.1).
+#
+# forward() still returns the same (p, pxyn_mean, pxy_std, bg) 4-tuple, so
+# downstream inference code (infer_positions, detect_via_nms_xy, ...) is
+# unchanged.
 # =============================================================================
+NORM = "batch"   # "batch" | "group"
+
+
+def _make_norm(num_channels, norm_groups=6):
+    if NORM == "batch":
+        return nn.BatchNorm2d(num_channels)
+    if NORM == "group":
+        return nn.GroupNorm(num_groups=norm_groups, num_channels=num_channels)
+    raise ValueError(f"unknown NORM={NORM!r}")
+
+
 class conv_block(nn.Module):
     def __init__(self, in_channels, out_channels, dropout=0.1, norm_groups=6, dilation=1):
         super().__init__()
+        # bias=False because both convs are immediately followed by a norm layer
+        # whose beta absorbs the effective bias.
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, 1, dilation, dilation=dilation, bias=True),
-            nn.GroupNorm(norm_groups, out_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1,
+                       padding=dilation, dilation=dilation, bias=False),
+            _make_norm(out_channels, norm_groups),
             nn.ELU(),
-            nn.Conv2d(out_channels, out_channels, 3, 1, dilation, dilation=dilation, bias=True),
-            nn.GroupNorm(norm_groups, out_channels),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1,
+                       padding=dilation, dilation=dilation, bias=False),
+            _make_norm(out_channels, norm_groups),
             nn.ELU(),
         )
 
@@ -80,9 +108,11 @@ class conv_block(nn.Module):
 class up_conv(nn.Module):
     def __init__(self, in_channels, out_channels, dropout=0.1, norm_groups=6):
         super().__init__()
+        # No norm here — bias stays True.
         self.up = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
-            nn.Conv2d(in_channels, out_channels, 3, 1, padding="same", bias=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1,
+                       padding="same", bias=True),
         )
 
     def forward(self, x):
@@ -92,11 +122,16 @@ class up_conv(nn.Module):
 class multi_head(nn.Module):
     def __init__(self, in_channels, out_channels, dropout=0.1, norm_groups=6):
         super().__init__()
+        # First conv is followed by norm -> bias=False. Final 1x1 conv has no
+        # norm after it and must keep bias=True (the p-head's bias init of -8.1
+        # depends on this bias existing).
         self.multi_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, 1, padding="same", bias=True),
-            nn.GroupNorm(norm_groups, in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1,
+                       padding="same", bias=False),
+            _make_norm(in_channels, norm_groups),
             nn.ELU(),
-            nn.Conv2d(in_channels, out_channels, 1, 1, padding="same", bias=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1,
+                       padding="same", bias=True),
         )
 
     def forward(self, x):
@@ -106,34 +141,45 @@ class multi_head(nn.Module):
 class GaussianMixtureModel(nn.Module):
     def __init__(self, num_channels):
         super().__init__()
-        self.out_channels_heads = (1, 3, 3, 1)
         self.num_channels = num_channels
 
+        # --- Encoder: 3 levels + dilated bottleneck ---
         self.Conv1 = conv_block(num_channels, 36, norm_groups=6)
-        self.Maxpool1 = nn.MaxPool2d(2, 2)
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.Conv2 = conv_block(36, 72, norm_groups=6)
-        self.Maxpool2 = nn.MaxPool2d(2, 2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.Conv3 = conv_block(72, 144, norm_groups=6)
-        self.Maxpool3 = nn.MaxPool2d(2, 2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.Conv4 = nn.Sequential(
             conv_block(144, 288, norm_groups=6, dilation=2),
             conv_block(288, 288, norm_groups=6, dilation=4),
         )
+
+        # --- Decoder: 3 upsampling levels back to full resolution ---
         self.Up3 = up_conv(288, 144, norm_groups=6)
         self.Up_conv3 = conv_block(288, 144, norm_groups=6)
         self.Up2 = up_conv(144, 72, norm_groups=6)
         self.Up_conv2 = conv_block(144, 72, norm_groups=6)
         self.Up1 = up_conv(72, 36, norm_groups=6)
         self.Up_conv1 = conv_block(72, 36, norm_groups=6)
-        self.dropout = nn.Dropout2d(p=0.3)
-        self.sigma_eps = 0.001
-        self.tanh_scale = 1.0
-        self.mt_heads = nn.ModuleList([
-            multi_head(36, ch, norm_groups=6) for ch in self.out_channels_heads
-        ])
+
+        # Applied host-side to mu_xy at inference. Set to the final training
+        # value (6.0 for v9). Not a buffer — not in state_dict.
+        self.tanh_scale = 6.0
+
+        # Five named heads (split from the old 3-channel mu head).
+        self.head_p     = multi_head(36, 1, norm_groups=6)
+        self.head_mu_xy = multi_head(36, 2, norm_groups=6)
+        self.head_mu_a  = multi_head(36, 1, norm_groups=6)
+        self.head_sigma = multi_head(36, 3, norm_groups=6)
+        self.head_bg    = multi_head(36, 1, norm_groups=6)
+
         self.initialize_weights()
-        nn.init.constant_(self.mt_heads[0].multi_head[-1].bias, -8.1)
-        nn.init.zeros_(self.mt_heads[0].multi_head[-1].weight)
+
+        # p-head init: bias -8.1 -> sigmoid ~ 0.0003. Overwritten by the
+        # checkpoint at load time anyway.
+        nn.init.constant_(self.head_p.multi_head[-1].bias, -8.1)
+        nn.init.zeros_(self.head_p.multi_head[-1].weight)
 
     def initialize_weights(self):
         for m in self.modules():
@@ -141,25 +187,29 @@ class GaussianMixtureModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.GroupNorm):
+            elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, training=False):
+    def forward_heads(self, x):
         x1 = self.Conv1(x)
         x2 = self.Conv2(self.Maxpool1(x1))
         x3 = self.Conv3(self.Maxpool2(x2))
         x4 = self.Conv4(self.Maxpool3(x3))
-        d3 = self.Up3(x4); d3 = torch.cat((x3, d3), dim=1); d3 = self.Up_conv3(d3)
-        d2 = self.Up2(d3); d2 = torch.cat((x2, d2), dim=1); d2 = self.Up_conv2(d2)
-        d1 = self.Up1(d2); d1 = torch.cat((x1, d1), dim=1); d1 = self.Up_conv1(d1)
-        d = [h(d1) for h in self.mt_heads]
-        p = torch.sigmoid(torch.clamp(d[0], min=-20.0, max=20.0))
-        pxyn_mean = d[1]
-        pxyn_mean[:, [0, 1], ...] = torch.tanh(pxyn_mean[:, [0, 1], ...]) * self.tanh_scale
-        pxyn_mean[:, [2], ...] = torch.sigmoid(pxyn_mean[:, [2], ...]) * 100
-        pxy_std = torch.sigmoid(d[2]) * 1.4 + 0.1
-        bg = d[3]
+        d3 = self.Up3(x4);  d3 = torch.cat((x3, d3), dim=1); d3 = self.Up_conv3(d3)
+        d2 = self.Up2(d3);  d2 = torch.cat((x2, d2), dim=1); d2 = self.Up_conv2(d2)
+        d1 = self.Up1(d2);  d1 = torch.cat((x1, d1), dim=1); d1 = self.Up_conv1(d1)
+        p     = torch.sigmoid(self.head_p(d1))
+        mu_xy = torch.tanh(self.head_mu_xy(d1))
+        mu_a  = torch.sigmoid(self.head_mu_a(d1))
+        sigma = torch.sigmoid(self.head_sigma(d1))
+        bg    = self.head_bg(d1)
+        return p, mu_xy, mu_a, sigma, bg
+
+    def forward(self, x, training=False):
+        p, mu_xy, mu_a, sigma, bg = self.forward_heads(x)
+        pxyn_mean = torch.cat([mu_xy * self.tanh_scale, mu_a * 100.0], dim=1)
+        pxy_std = sigma * 2.4 + 0.1
         return p, pxyn_mean, pxy_std, bg
 
 
@@ -844,8 +894,15 @@ def load_model(model_path):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = GaussianMixtureModel(num_channels=1)
     model.load_state_dict(torch.load(model_path, map_location=device))
+    # eval() is REQUIRED for BatchNorm2d — it switches BN to use the tracked
+    # running_mean / running_var instead of the current batch's stats (batch
+    # size is 1 during tile-by-tile inference, so training-mode BN would be
+    # garbage).
     model.to(device).eval()
-    (model._orig_mod if hasattr(model, "_orig_mod") else model).tanh_scale = 1.0
+    # tanh_scale is a plain attribute (not in state_dict). GaussianMixtureModel
+    # already defaults it to the v9 final training value (6.0); re-pin here so
+    # the value is explicit in the inference path.
+    (model._orig_mod if hasattr(model, "_orig_mod") else model).tanh_scale = 6.0
     return model, device
 
 
@@ -1142,10 +1199,13 @@ def parse_args(argv=None):
                         "choice; density is reported as count / area.")
     p.add_argument("--area-units", default="mm^2",
                    help="Label for the area units (echoed into CSVs).")
-    p.add_argument("--model-path", default="pram_dense_final_v7.pth",
-                   help="Path to the .pth checkpoint. Relative paths are "
-                        "resolved against the current dir then next to this "
-                        "script.")
+    p.add_argument("--model-path", default="pram_dense_final_v9.pth",
+                   help="Path to the .pth checkpoint (v9 batchnorm build "
+                        "expected — the arch here has split heads and "
+                        "BatchNorm; older v7 GroupNorm checkpoints won't "
+                        "load without swapping NORM back to 'group' and "
+                        "reverting to the pre-v9 head layout). Relative "
+                        "paths resolve against cwd then this script's dir.")
     p.add_argument("--image-ext", default=".jpg",
                    help="Extension for input images inside each cycle folder.")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,

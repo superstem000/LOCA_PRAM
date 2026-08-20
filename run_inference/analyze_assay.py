@@ -1199,7 +1199,7 @@ def parse_args(argv=None):
                         "choice; density is reported as count / area.")
     p.add_argument("--area-units", default="mm^2",
                    help="Label for the area units (echoed into CSVs).")
-    p.add_argument("--model-path", default="pram_dense_final_v10.pth",
+    p.add_argument("--model-path", default="pram_dense_final_v11.pth",
                    help="Path to the .pth checkpoint (v9 batchnorm build "
                         "expected — the arch here has split heads and "
                         "BatchNorm; older v7 GroupNorm checkpoints won't "

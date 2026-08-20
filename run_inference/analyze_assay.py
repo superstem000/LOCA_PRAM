@@ -21,12 +21,15 @@ Two run modes:
      <assay>/analysis/counts_over_time_{topK,middleK}.png
      <assay>/analysis/boxplot_over_time_{topK,middleK}.png
    When any assay folder name starts with `NNN.N` (concentration),
-   cross-assay concentration aggregation lands in `<assays-root>/analysis/`:
-     per_concentration_per_cycle.csv
-     counts_over_time_by_concentration.png
-   and, mirrored for whichever subset flags are set:
-     per_concentration_per_cycle_{topK,middleK}.csv
-     counts_over_time_by_concentration_{topK,middleK}.png
+   cross-assay concentration aggregation lands in `<assays-root>/analysis/`.
+   Tiles are pooled across every folder at a concentration BEFORE any
+   selection, so --top-k / --middle-k at concentration level pick K across
+   the full pool, not per-folder K. For each of full / topK / middleK:
+     per_concentration_per_cycle[_topK,_middleK].csv       summary stats
+     counts_over_time_by_concentration[_topK,_middleK].png mean+ribbon lines
+     boxplot_by_concentration[_topK,_middleK].png          grouped box per
+                                                           (cycle, conc)
+                                                           to show range
 
 Detection settings (model, threshold, NMS kernel, forbidden mask, dedup)
 match `LOCA_PRAM_batch_assays_eval.ipynb` exactly, so counts are numerically
@@ -554,24 +557,37 @@ def build_summary_from_subset(per_tile_subset, per_tile_all, k):
 # =============================================================================
 # Analysis — per concentration (cross-assay)
 # =============================================================================
-def build_per_concentration(entries, area_per_tile, area_units):
-    """entries: list of {'assay': str, 'concentration': str, 'per_tile': df}.
-    Pools tiles across assays sharing a concentration; returns one row per
-    (concentration, cycle) with count/density stats. Density is recomputed
-    from n_detections with the current --area so units are consistent even
-    if per_tile.csv came from a run with a different area setting."""
-    if not entries:
-        return pd.DataFrame()
+def pool_by_concentration(entries, area_per_tile):
+    """entries: [{'assay': str, 'concentration': str, 'per_tile': df}, ...]
+    Returns {concentration: pooled_df} where pooled_df concatenates every
+    folder's per_tile rows at that concentration and adds an `assay` column
+    (so n_assays / n_tiles can be tracked). `density` is recomputed from
+    `n_detections` with the current --area so units are consistent across
+    assays that may have been analyzed with a different area setting.
+
+    This is the pool used for cross-concentration analysis: top-K / mid-K
+    selections at concentration level operate on this pool, so the K
+    highest-count tiles are picked across ALL folders at a concentration,
+    not per folder.
+    """
     by_conc = {}
     for e in entries:
         df = e["per_tile"].copy()
         df["assay"] = e["assay"]
         df["density"] = df["n_detections"] / area_per_tile
         by_conc.setdefault(e["concentration"], []).append(df)
+    return {c: pd.concat(dfs, ignore_index=True) for c, dfs in by_conc.items()}
 
+
+def summarize_per_conc_pool(pooled_by_conc, area_per_tile, area_units):
+    """One row per (concentration, cycle) with count/density stats over the
+    pooled tiles. `pooled_by_conc` must be a {conc: df} dict where each df
+    already has `assay`, `density`, `n_detections`, `cycle`, `t_min` columns
+    (i.e., the output of `pool_by_concentration` or a subset thereof)."""
     rows = []
-    for conc, dfs in by_conc.items():
-        pooled = pd.concat(dfs, ignore_index=True)
+    for conc, pooled in pooled_by_conc.items():
+        if len(pooled) == 0:
+            continue
         for (cycle, t_min), g in pooled.groupby(["cycle", "t_min"]):
             rows.append({
                 "concentration":     conc,
@@ -593,6 +609,18 @@ def build_per_concentration(entries, area_per_tile, area_units):
     return (pd.DataFrame(rows)
               .sort_values(["concentration", "cycle"])
               .reset_index(drop=True))
+
+
+def subset_pool_by_conc(pooled_by_conc, subset_fn, k):
+    """Apply `subset_fn` (top_k_per_cycle / middle_k_per_cycle) INSIDE each
+    concentration's pooled df — so the K tiles are picked across all folders
+    at that concentration, not per folder. Returns {conc: subset_df}."""
+    out = {}
+    for conc, pooled in pooled_by_conc.items():
+        sub = subset_fn(pooled, k)
+        if len(sub):
+            out[conc] = sub
+    return out
 
 
 # =============================================================================
@@ -844,6 +872,72 @@ def plot_counts_over_time_by_concentration(per_conc, out_path, thr, nms_k,
                  f"(thr={thr}, nms={nms_k})")
     ax.legend(title="concentration", fontsize=9, loc="best")
     ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_boxplot_by_concentration(pooled_by_conc, out_path, thr, nms_k,
+                                   minutes_per_cycle, title_suffix=""):
+    """Grouped boxplot: at each cycle timestamp, one box per concentration
+    side-by-side. Shows the full tile-count distribution (median line, IQR
+    box, whiskers, mean marker) so the range across pooled tiles is visible
+    for every (concentration, cycle) pair. `pooled_by_conc` is
+    {concentration: df_with_n_detections_and_t_min}."""
+    if not pooled_by_conc:
+        return
+    concs = sorted(pooled_by_conc.keys(), key=lambda c: float(c))
+    n_conc = len(concs)
+
+    all_t = sorted({float(t)
+                    for df in pooled_by_conc.values()
+                    for t in df["t_min"].unique()})
+    if not all_t:
+        return
+
+    # Layout: box widths and per-concentration horizontal offsets scaled to
+    # the tightest cycle spacing so boxes don't overlap between time points.
+    step = float(np.min(np.diff(all_t))) if len(all_t) > 1 else float(minutes_per_cycle)
+    slot = step / (n_conc + 1)
+    box_width = slot * 0.75
+    offsets = [(-(n_conc - 1) / 2 + i) * slot for i in range(n_conc)]
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.5 * len(all_t) * n_conc + 4), 5.5))
+    cmap = plt.get_cmap("viridis", max(n_conc, 2))
+
+    for i, conc in enumerate(concs):
+        by_t = pooled_by_conc[conc].groupby("t_min")["n_detections"].apply(list)
+        positions, data = [], []
+        for t in all_t:
+            if t in by_t.index:
+                positions.append(t + offsets[i])
+                data.append(list(by_t[t]))
+        if not data:
+            continue
+        bp = ax.boxplot(data, positions=positions, widths=box_width,
+                        patch_artist=True, showmeans=True, meanline=True,
+                        medianprops=dict(color="black", lw=1.2),
+                        meanprops=dict(color="crimson", lw=1.2, ls="--"))
+        for patch in bp["boxes"]:
+            patch.set_facecolor(cmap(i))
+            patch.set_alpha(0.55)
+            patch.set_edgecolor("black")
+            patch.set_linewidth(0.8)
+
+    ax.set_xticks(all_t)
+    ax.set_xticklabels([f"{t:.0f}" for t in all_t])
+    ax.set_xlabel("time (min, first cycle = t=0)")
+    ax.set_ylabel(f"# detections per tile  (thr={thr}, nms={nms_k})")
+    ax.set_title(f"Detections per tile by concentration{title_suffix}  "
+                 f"(median = black, mean = crimson dashed)")
+    legend_patches = [
+        plt.Rectangle((0, 0), 1, 1, fc=cmap(i), alpha=0.55, ec="black",
+                      lw=0.8, label=str(c))
+        for i, c in enumerate(concs)
+    ]
+    ax.legend(handles=legend_patches, title="concentration",
+              fontsize=9, loc="best")
+    ax.grid(alpha=0.3, axis="y")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -1132,49 +1226,53 @@ def run(args):
             root_analysis = os.path.join(root, "analysis")
             os.makedirs(root_analysis, exist_ok=True)
 
-            per_conc = build_per_concentration(entries, args.area, args.area_units)
-            if len(per_conc):
-                per_conc.to_csv(
-                    os.path.join(root_analysis, "per_concentration_per_cycle.csv"),
-                    index=False)
-                plot_counts_over_time_by_concentration(
-                    per_conc,
-                    os.path.join(root_analysis, "counts_over_time_by_concentration.png"),
-                    args.threshold, args.nms_kernel)
-                print(f"wrote {root_analysis}/per_concentration_per_cycle.csv")
-                print(f"wrote {root_analysis}/counts_over_time_by_concentration.png")
+            # Pool tiles once per concentration; subset flags below all work
+            # off this pool so K tiles are picked ACROSS folders at each
+            # concentration (not per folder).
+            pooled_full = pool_by_concentration(entries, args.area)
 
-            for k_val, subset_fn, suffix, label in (
-                (args.top_k, top_k_per_cycle, "topK", f"top {args.top_k}"),
-                (args.middle_k, middle_k_per_cycle, "middleK",
-                    f"middle {args.middle_k}"),
-            ):
+            modes = [(None, None, "", "")]                    # full baseline
+            if args.top_k is not None:
+                modes.append((args.top_k, top_k_per_cycle,
+                              "_topK", f"  (top {args.top_k})"))
+            if args.middle_k is not None:
+                modes.append((args.middle_k, middle_k_per_cycle,
+                              "_middleK", f"  (middle {args.middle_k})"))
+
+            for k_val, subset_fn, file_suffix, title_suffix in modes:
                 if k_val is None:
+                    pooled_mode = pooled_full
+                else:
+                    pooled_mode = subset_pool_by_conc(
+                        pooled_full, subset_fn, k_val)
+                if not pooled_mode:
                     continue
-                subset_entries = []
-                for e in entries:
-                    sub_pt = subset_fn(e["per_tile"], k_val)
-                    if len(sub_pt):
-                        subset_entries.append({
-                            "assay":         e["assay"],
-                            "concentration": e["concentration"],
-                            "per_tile":      sub_pt,
-                        })
-                per_conc_sub = build_per_concentration(
-                    subset_entries, args.area, args.area_units)
-                if len(per_conc_sub):
-                    per_conc_sub.to_csv(
-                        os.path.join(root_analysis,
-                                      f"per_concentration_per_cycle_{suffix}.csv"),
-                        index=False)
+
+                summary_df = summarize_per_conc_pool(
+                    pooled_mode, args.area, args.area_units)
+
+                if len(summary_df):
+                    csv_path = os.path.join(
+                        root_analysis,
+                        f"per_concentration_per_cycle{file_suffix}.csv")
+                    summary_df.to_csv(csv_path, index=False)
                     plot_counts_over_time_by_concentration(
-                        per_conc_sub,
+                        summary_df,
                         os.path.join(root_analysis,
-                                      f"counts_over_time_by_concentration_{suffix}.png"),
+                                      f"counts_over_time_by_concentration{file_suffix}.png"),
                         args.threshold, args.nms_kernel,
-                        title_suffix=f"  ({label})")
-                    print(f"wrote per_concentration_per_cycle_{suffix}.csv")
-                    print(f"wrote counts_over_time_by_concentration_{suffix}.png")
+                        title_suffix=title_suffix)
+                    print(f"wrote per_concentration_per_cycle{file_suffix}.csv")
+                    print(f"wrote counts_over_time_by_concentration{file_suffix}.png")
+
+                plot_boxplot_by_concentration(
+                    pooled_mode,
+                    os.path.join(root_analysis,
+                                  f"boxplot_by_concentration{file_suffix}.png"),
+                    args.threshold, args.nms_kernel,
+                    args.minutes_per_cycle,
+                    title_suffix=title_suffix)
+                print(f"wrote boxplot_by_concentration{file_suffix}.png")
 
     print(f"\ntotal wall time: {time.time()-t_all:.1f}s")
 

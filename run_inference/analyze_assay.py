@@ -1231,13 +1231,35 @@ def run(args):
             # concentration (not per folder).
             pooled_full = pool_by_concentration(entries, args.area)
 
+            # Resolve the per-concentration K lists:
+            #   --conc-top-k / --conc-middle-k override --top-k / --middle-k
+            #   for concentration-level outputs. Filenames get a numeric
+            #   suffix (_topK15, _middleK20) so multiple K values coexist.
+            #   Legacy fallback: if only --top-k is set (no --conc-top-k),
+            #   the concentration file uses the plain `_topK` suffix for
+            #   backward compat with earlier runs.
+            if args.conc_top_k is not None:
+                top_specs = [(k, f"_topK{k}", f"top {k}")
+                             for k in args.conc_top_k]
+            elif args.top_k is not None:
+                top_specs = [(args.top_k, "_topK", f"top {args.top_k}")]
+            else:
+                top_specs = []
+
+            if args.conc_middle_k is not None:
+                mid_specs = [(k, f"_middleK{k}", f"middle {k}")
+                             for k in args.conc_middle_k]
+            elif args.middle_k is not None:
+                mid_specs = [(args.middle_k, "_middleK",
+                              f"middle {args.middle_k}")]
+            else:
+                mid_specs = []
+
             modes = [(None, None, "", "")]                    # full baseline
-            if args.top_k is not None:
-                modes.append((args.top_k, top_k_per_cycle,
-                              "_topK", f"  (top {args.top_k})"))
-            if args.middle_k is not None:
-                modes.append((args.middle_k, middle_k_per_cycle,
-                              "_middleK", f"  (middle {args.middle_k})"))
+            for k, suffix, label in top_specs:
+                modes.append((k, top_k_per_cycle, suffix, f"  ({label})"))
+            for k, suffix, label in mid_specs:
+                modes.append((k, middle_k_per_cycle, suffix, f"  ({label})"))
 
             for k_val, subset_fn, file_suffix, title_suffix in modes:
                 if k_val is None:
@@ -1275,6 +1297,26 @@ def run(args):
                 print(f"wrote boxplot_by_concentration{file_suffix}.png")
 
     print(f"\ntotal wall time: {time.time()-t_all:.1f}s")
+
+
+def _parse_k_list(s):
+    """argparse type for --conc-top-k / --conc-middle-k. Parses '10,15,20'
+    into a sorted list of unique positive ints. Empty string / bad values
+    raise argparse.ArgumentTypeError so argparse prints a clean message."""
+    if s is None or not str(s).strip():
+        raise argparse.ArgumentTypeError("expected a comma-separated list of "
+                                         "positive integers, got empty string")
+    try:
+        ks = [int(x.strip()) for x in s.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"couldn't parse {s!r} as comma-separated ints "
+            "(example: '10,15,20')")
+    ks = sorted({k for k in ks if k > 0})
+    if not ks:
+        raise argparse.ArgumentTypeError(
+            f"no positive integers in {s!r} (example: '10,15,20')")
+    return ks
 
 
 def parse_args(argv=None):
@@ -1329,6 +1371,22 @@ def parse_args(argv=None):
                         "and the top tail of unusually hot tiles). Files "
                         "mirror --top-k with `_middleK` suffix. Can be used "
                         "together with --top-k.")
+    p.add_argument("--conc-top-k", type=_parse_k_list, default=None,
+                   metavar="K1,K2,...",
+                   help="Comma-separated list of K values, per-concentration "
+                        "top-K only. When set, OVERRIDES --top-k for the "
+                        "cross-concentration outputs and writes one set of "
+                        "files per K (per_concentration_per_cycle_topK<n>.csv, "
+                        "counts_over_time_by_concentration_topK<n>.png, "
+                        "boxplot_by_concentration_topK<n>.png). Per-assay "
+                        "top-K files still use --top-k and are unchanged. "
+                        "Example: --conc-top-k 10,15,20")
+    p.add_argument("--conc-middle-k", type=_parse_k_list, default=None,
+                   metavar="K1,K2,...",
+                   help="Same as --conc-top-k but for middle-K. Lets you "
+                        "compare mid-10 / mid-15 / mid-20 side by side at "
+                        "concentration level without touching per-assay "
+                        "outputs. Example: --conc-middle-k 10,15,20")
     p.add_argument("--force", action="store_true",
                    help="Under --assays-root, re-run inference and baseline "
                         "analysis even when analysis/per_tile.csv already "

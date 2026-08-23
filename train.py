@@ -42,6 +42,8 @@ import matplotlib
 matplotlib.use("Agg")   # headless (no viz windows during batch runs)
 import matplotlib.pyplot as plt
 import cv2
+from tqdm.auto import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 Image.MAX_IMAGE_PIXELS = None
 

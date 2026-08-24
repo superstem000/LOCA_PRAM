@@ -592,6 +592,12 @@ class GaussianMixtureModel(nn.Module):
         # attribute (not a buffer/parameter). Applied host-side at export.
         self.tanh_scale = 6.0
 
+        # sigma output scaling: pxy_std = sigma * sigma_scale + sigma_floor.
+        # Defaults reproduce the shipped (0.1, 2.5) range. Load-bearing target
+        # of the σ-floor ablation — set from CLI in main().
+        self.sigma_scale = 2.4
+        self.sigma_floor = 0.1
+
         # =====================================================================
         # FIVE NAMED HEADS — split from the old 3-channel mu head so we no
         # longer need an in-place slice assignment (which exports as ScatterND).
@@ -660,7 +666,10 @@ class GaussianMixtureModel(nn.Module):
         """
         p, mu_xy, mu_a, sigma, bg = self.forward_heads(x)
         pxyn_mean = torch.cat([mu_xy * self.tanh_scale, mu_a * 100.0], dim=1)  # (B, 3, H, W)
-        pxy_std   = sigma * 2.4 + 0.1                                          # sigma in (0.1, 2.5)
+        # sigma_scale and sigma_floor are settable model attributes (defaults
+        # 2.4 and 0.1 → range [0.1, 2.5]). See main() for CLI overrides. The
+        # floor in particular is the ablation target for the σ-floor study.
+        pxy_std   = sigma * self.sigma_scale + self.sigma_floor
         return p, pxyn_mean, pxy_std, bg
 
     def forward_export(self, x):
@@ -974,10 +983,11 @@ def train(model, num_epoch, start_epoch, optimizer, scheduler, loss_fun,
         epoch_start_time = time.time()
         model.train()
 
-        # ---- per-epoch curriculum (tanh + loss weights) ----
-        _ts = get_tanh_scale(epoch)
+        # ---- per-epoch curriculum (loss weights only) ----
+        # tanh_scale is pinned once from CLI (--tanh-scale) at main() and NOT
+        # overridden per-epoch. The old get_tanh_scale(epoch) returned 1.0
+        # always (dead curriculum), which silently defeated any CLI override.
         _w  = get_loss_weights(epoch)
-        (model._orig_mod if hasattr(model, '_orig_mod') else model).tanh_scale = _ts
 
         batch_loss_list = []
         count_loss_list, gmm_loss_list, bg_loss_list = [], [], []
@@ -1075,10 +1085,68 @@ def train(model, num_epoch, start_epoch, optimizer, scheduler, loss_fun,
             writer.add_scalar('Loss/Train',      train_loss[epoch],        epoch + 1)
             writer.add_scalar('Loss/Test',       test_loss[epoch],         epoch + 1)
             writer.add_scalar('LR',              lr,                       epoch + 1)
-            writer.add_scalar('TanhScale',       _ts,                      epoch + 1)
+            # Model attributes (constant post-CLI-override; here for reproducibility).
+            _mdl = model._orig_mod if hasattr(model, '_orig_mod') else model
+            writer.add_scalar('Model/tanh_scale',  _mdl.tanh_scale,        epoch + 1)
+            writer.add_scalar('Model/sigma_floor', _mdl.sigma_floor,       epoch + 1)
+            writer.add_scalar('Model/sigma_scale', _mdl.sigma_scale,       epoch + 1)
             writer.add_scalar('Weights/count',   _w['count'],              epoch + 1)
             writer.add_scalar('Weights/gmm',     _w['gmm'],                epoch + 1)
             writer.add_scalar('Weights/bg',      _w['bg'],                 epoch + 1)
+
+            # ---------- σ-floor ablation diagnostics ----------
+            # Two histograms per epoch (from the LAST training batch of the epoch —
+            # cheap, no extra forward passes). These answer:
+            #   1) Is the model's predicted σ actually descending toward the floor?
+            #      If yes, floor is binding. If no, the floor isn't doing much and
+            #      the ablation's "raise the floor" claim is on shakier ground.
+            #   2) How far off the peak-p pixel lands from the true center — as a
+            #      training-dynamics history. If this shrinks over training, then
+            #      the σ-floor / peak-vs-center coupling matters early and fades.
+            try:
+                with torch.no_grad():
+                    # (1) Predicted σ distribution. pxy_std shape (B, 3, H, W);
+                    # channels 0/1 are σ_x, σ_y (channel 2 is unused per-particle scale).
+                    sig_flat = pxy_std[:, :2, ...].reshape(-1).float().cpu()
+                    writer.add_histogram('Debug/pxy_std_predicted', sig_flat, epoch + 1)
+                    writer.add_scalar('Debug/pxy_std_min',    float(sig_flat.min()),    epoch + 1)
+                    writer.add_scalar('Debug/pxy_std_median', float(sig_flat.median()), epoch + 1)
+
+                    # (2) Peak-pixel-to-true-center distance (in model-input px).
+                    # For each true particle in the last batch, find the argmax of p
+                    # in a local window around its GT pixel and compute the Euclidean
+                    # distance from that peak pixel to the true continuous center.
+                    B, _, H, W = p.shape
+                    p_np      = p[:, 0, ...].float().cpu().numpy()          # (B, H, W)
+                    labels_np = labels.float().cpu().numpy()                 # (B, 3, H, W)
+                    dists = []
+                    # Window: a few σ_x either side of the true integer pixel.
+                    win = max(3, int(round(3.0 * _mdl.tanh_scale + 6)))       # generous
+                    for b in range(B):
+                        presence = labels_np[b, 2, ...] > 0
+                        ys, xs = np.where(presence)
+                        for iy, ix in zip(ys, xs):
+                            dx_off = labels_np[b, 0, iy, ix]  # true center x = ix + dx_off
+                            dy_off = labels_np[b, 1, iy, ix]  # true center y = iy + dy_off
+                            y0, y1 = max(0, iy - win), min(H, iy + win + 1)
+                            x0, x1 = max(0, ix - win), min(W, ix + win + 1)
+                            patch = p_np[b, y0:y1, x0:x1]
+                            if patch.size == 0:
+                                continue
+                            fy, fx = np.unravel_index(patch.argmax(), patch.shape)
+                            peak_y = y0 + fy
+                            peak_x = x0 + fx
+                            true_x = ix + dx_off
+                            true_y = iy + dy_off
+                            dists.append(float(np.hypot(peak_x - true_x, peak_y - true_y)))
+                    if dists:
+                        dists_t = torch.tensor(dists)
+                        writer.add_histogram('Debug/peak_to_center_dist_px', dists_t, epoch + 1)
+                        writer.add_scalar('Debug/peak_to_center_mean_px',    float(dists_t.mean()),   epoch + 1)
+                        writer.add_scalar('Debug/peak_to_center_median_px',  float(dists_t.median()), epoch + 1)
+            except Exception as _e:
+                # Never let the diagnostics kill training.
+                print(f"  [warn] σ-floor diagnostics failed at epoch {epoch}: {_e}")
 
         pbar.set_description(
             f"Epoch {epoch+1} | Loss: {np.mean(batch_loss_list):.4f} "
@@ -1140,6 +1208,18 @@ def parse_args(argv=None):
     p.add_argument("--tanh-scale", type=float, default=6.0,
                    help="Scalar multiplier on the mu_xy tanh output. Set at model "
                         "construction and NOT annealed per-epoch.")
+    p.add_argument("--sigma-scale", type=float, default=2.4,
+                   help="Multiplier on sigmoid(sigma) output. Inherited from "
+                        "LOCA-PRAM's pre-existing codebase; leave at default "
+                        "unless you know why you're changing it.")
+    p.add_argument("--sigma-floor", type=float, default=0.1,
+                   help="Additive floor on the predicted pxy_std: "
+                        "pxy_std = sigmoid(sigma) * sigma_scale + sigma_floor. "
+                        "DECODE's default is 0.001; we raise 100x to prevent "
+                        "delta-like predictions from blowing up the GMM loss "
+                        "when peak-pixel != true-center is inherent (wide-PSF "
+                        "particles). Ablation target: set to 0.001 to test the "
+                        "training-dynamics claim.")
 
     # --- PSF GEOMETRY (native px, divided by --downscale-factor internally) ---
     p.add_argument("--downscale-factor", type=int, default=2)
@@ -1289,8 +1369,12 @@ def main(args):
     # Set tanh_scale ONCE. The training loop (get_tanh_scale) has been
     # neutralised so it won't override this.
     model.tanh_scale = args.tanh_scale
+    model.sigma_scale = args.sigma_scale
+    model.sigma_floor = args.sigma_floor
     model.to(device)
     print(f"  model.tanh_scale  = {model.tanh_scale}")
+    print(f"  sigma output      = sigmoid(sigma) * {model.sigma_scale} + {model.sigma_floor}")
+    print(f"                      -> range [{model.sigma_floor}, {model.sigma_scale + model.sigma_floor}]")
 
     loss_fun = GMMLoss(img_size=window_size[0], device=device)
     writer = SummaryWriter(output_dir, flush_secs=10)

@@ -74,13 +74,31 @@ def load_all_per_tile(assays_root, area):
     return pd.concat(rows_list, ignore_index=True)
 
 
-def find_annotated_png(assay_dir, cycle_folder, image_name):
-    """The per-image annotated PNG lives at:
-        <assay_dir>/analysis/<cycle_folder>/<basename>.png
-    where basename is the input image filename minus its extension.
+_TILE_RE  = re.compile(r"tile_(\d+)_(\d+)_", re.IGNORECASE)
+_CYCLE_RE = re.compile(r"(?:cycle|demo)_(\d+)", re.IGNORECASE)
+
+
+def scan_annotated_pngs(assay_dir):
+    """Walks <assay_dir>/analysis/<cycle_*/demo_*>/*.png and returns
+       {(cycle_num, "row,col"): abs_path_to_png}
+    Tile id is parsed from the PNG basename via the same tile_r_c_ regex
+    analyze_assay.py used to build per_tile.csv, so keys line up 1-1 with
+    per_tile.csv rows that used the parsed-from-filename tile source.
     """
-    base = os.path.splitext(image_name)[0]
-    return os.path.join(assay_dir, "analysis", cycle_folder, base + ".png")
+    out = {}
+    for png in glob.glob(os.path.join(assay_dir, "analysis", "*", "*.png")):
+        cycle_folder = os.path.basename(os.path.dirname(png))
+        m_cyc = _CYCLE_RE.match(cycle_folder)
+        if not m_cyc:
+            continue
+        cyc = int(m_cyc.group(1))
+        base = os.path.splitext(os.path.basename(png))[0]
+        m_tile = _TILE_RE.match(base)
+        if not m_tile:
+            continue
+        tile_id = f"{int(m_tile.group(1))},{int(m_tile.group(2))}"
+        out[(cyc, tile_id)] = os.path.abspath(png)
+    return out
 
 
 def main(args):
@@ -111,12 +129,26 @@ def main(args):
     sel = pd.concat(selected, ignore_index=True)
     print(f"middle-{K} per (concentration, cycle) selected: {len(sel)} tiles")
 
-    # 3. Copy + rename each selected tile's annotated PNG
+    # 3. Build a per-assay lookup from (cycle_num, "row,col") -> PNG path.
+    #    We scan the per-image annotated PNGs the analysis already wrote
+    #    into <assay>/analysis/cycle_*/*.png, because per_tile.csv itself
+    #    doesn't retain the source-image filename (it's grouped by tile).
+    png_lookups = {a: scan_annotated_pngs(sel[sel["assay"] == a]["assay_dir"].iloc[0])
+                   for a in sel["assay"].unique()}
+    print(f"scanned annotated-PNG lookups for {len(png_lookups)} assays")
+
+    # 4. Copy + rename each selected tile's annotated PNG.
     tile_rows = []
     for _, r in sel.iterrows():
         t_min = int(round((int(r["cycle"]) - 1) * minutes_per_cycle))
         new_name = f"{r['concentration']}_{t_min}min_{int(r['ordinal'])}.png"
-        src = find_annotated_png(r["assay_dir"], r["demo"], r["image"])
+        key = (int(r["cycle"]), str(r["tile"]))
+        src = png_lookups[r["assay"]].get(key)
+        if src is None:
+            sys.exit(f"error: no annotated PNG found for assay={r['assay']!r} "
+                     f"cycle={r['cycle']} tile={r['tile']!r} — was inference "
+                     "run with --no-images, or is the tile using ordinal "
+                     "fallback (unsupported)?")
         dst = os.path.join(results_dir, new_name)
         shutil.copyfile(src, dst)
         tile_rows.append({
